@@ -1,0 +1,17 @@
+# follow.burst mode
+#
+# Fires a fixed number of clicks at cursor position, then stops.
+# Toggle on to fire another burst.
+#
+# clicks         Number of clicks per burst
+# jitter_clicks  Random offset on click count (±)
+# interval       ms between clicks
+# jitter_ms      ms random offset added to interval
+# jitter_px      px random offset on x/y per click
+
+method = "adb-pipe"
+clicks = 10
+jitter_clicks = 0
+interval = 13
+jitter_ms = 3
+jitter_px = 10

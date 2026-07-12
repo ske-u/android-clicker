@@ -1,0 +1,24 @@
+[project]
+name = "android-clicker"
+version = "0.1.0"
+description = "Auto-clicker daemon for Android emulators — Waydroid on Linux (Hyprland/Wayland) and BlueStacks on macOS"
+requires-python = ">=3.11"
+license = {text = "GPL-3.0-only"}
+readme = "README.md"
+dependencies = [
+    "pyautogui; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+overlay = ["PyQt6"]
+editor = ["PyQt6", "tomlkit"]
+uinput = ["python-evdev"]
+screencap = ["Pillow"]
+hotkeys = ["python-evdev"]
+
+[project.urls]
+Homepage = "https://github.com/ske-u/android-clicker"
+Repository = "https://github.com/ske-u/android-clicker"
+
+[project.scripts]
+android-clicker = "android_clicker.cli:main"

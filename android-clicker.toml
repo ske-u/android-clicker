@@ -1,0 +1,38 @@
+# Config reference — uncomment and set a value to change from the default.
+#
+# active = true                        # enable clicking on daemon start
+# mode = "fixed.myvariant"
+# uinput = false                       # enable persistent uinput device (requires python-evdev + input group)
+#
+# [launcher]
+# auto_start_daemon = false
+#
+# [display]
+# android_width = 1920                 # default: autodetect
+# android_height = 1080                # default: autodetect
+#
+# [notifications]
+# enabled = false
+# notify_backend = "hyprctl"           # hyprctl/libnotify
+#
+# [adb]
+# connect = "192.168.240.112:5555"     # default: 192.168.240.112:5555 for Waydroid, 127.0.0.1:5555 for Bluestacks
+# connect_timeout = 5
+#
+# [hotkeys]
+# toggle_clicking = "alt+space"        # default: not set
+# launcher = "ctrl+alt+l"              # default: not set
+# overlay = "meta+o"                   # default: not set
+# overlay_toggle = "shift+h"           # default: not set
+# burst_clicks_plus = "ctrl+up"        # default: not set
+# burst_clicks_minus = "ctrl+down"     # default: not set
+
+active = false
+mode = "follow"
+uinput = false
+
+[launcher]
+auto_start_daemon = false
+
+[notifications]
+enabled = false

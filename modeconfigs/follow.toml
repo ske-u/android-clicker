@@ -1,0 +1,11 @@
+# follow mode
+#
+# method         Injection backend: "adb-pipe" or "uinput"
+# interval       ms between clicks
+# jitter_ms      ms random offset added to interval
+# jitter_px      px random offset on x/y per click
+
+method = "adb-pipe"
+interval = 13
+jitter_ms = 3
+jitter_px = 10
