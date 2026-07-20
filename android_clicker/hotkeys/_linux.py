@@ -1,5 +1,8 @@
+import ctypes
+import ctypes.util
 import os as _os
 import select as _select
+import struct
 import sys
 import threading
 
@@ -17,6 +20,26 @@ _MOD_NAMES = {
     "alt": [ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT],
     "meta": [ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA],
 }
+
+_INOTIFY_MASK = 0x100
+_IN_NONBLOCK = 0o4000
+_IN_CLOEXEC = 0o2000000
+_INOTIFY_EVENT_SIZE = 16
+
+
+def _inotify_init():
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        fd = libc.inotify_init1(_IN_NONBLOCK | _IN_CLOEXEC)
+        if fd < 0:
+            return None
+        wd = libc.inotify_add_watch(fd, b"/dev/input", _INOTIFY_MASK)
+        if wd < 0:
+            _os.close(fd)
+            return None
+        return fd
+    except Exception:
+        return None
 
 
 class LinuxHotkeyImpl:
@@ -44,22 +67,31 @@ class LinuxHotkeyImpl:
                 self._all_mod_set.update(codes)
 
         self._devices = []
+        self._device_paths = set()
+        self._inotify_fd = None
         self._running = False
         self._thread = None
+        self._stop_r, self._stop_w = _os.pipe()
+        _os.set_blocking(self._stop_r, False)
+        _os.set_blocking(self._stop_w, False)
 
     def start(self):
         if not self._hotkeys:
             return
         self._running = True
         for path in list_devices():
+            if path in self._device_paths:
+                continue
             try:
                 dev = InputDevice(path)
                 if ecodes.EV_KEY in dev.capabilities():
                     _os.set_blocking(dev.fd, False)
                     self._devices.append(dev)
+                    self._device_paths.add(path)
             except (PermissionError, OSError):
                 pass
-        if not self._devices:
+        self._inotify_fd = _inotify_init()
+        if not self._devices and self._inotify_fd is None:
             print("hotkey: no input devices available", file=sys.stderr)
             self._running = False
             return
@@ -68,29 +100,47 @@ class LinuxHotkeyImpl:
 
     def stop(self):
         self._running = False
-        for dev in self._devices:
-            try:
-                dev.close()
-            except Exception:
-                pass
-        self._devices.clear()
+        try:
+            _os.write(self._stop_w, b"\x00")
+        except OSError:
+            pass
 
     def _run(self):
         mod_counts = {m: 0 for m in self._all_mod_codes}
         fd_map = {}
         poll = _select.epoll()
+
+        poll.register(self._stop_r, _select.EPOLLIN)
+        fd_map[self._stop_r] = None
+
         for dev in self._devices:
             fd = dev.fd
             fd_map[fd] = dev
             poll.register(fd, _select.EPOLLIN | _select.EPOLLHUP | _select.EPOLLERR)
 
+        if self._inotify_fd is not None:
+            fd_map[self._inotify_fd] = None
+            poll.register(self._inotify_fd, _select.EPOLLIN)
+
         try:
-            while self._running and self._devices:
+            while self._running:
                 try:
                     ready = poll.poll(timeout=0.1)
                 except InterruptedError:
                     continue
+
                 for fd, event in ready:
+                    if fd == self._stop_r:
+                        try:
+                            _os.read(self._stop_r, 4096)
+                        except OSError:
+                            pass
+                        return
+
+                    if self._inotify_fd is not None and fd == self._inotify_fd:
+                        self._handle_inotify(poll, fd_map)
+                        continue
+
                     if event & (_select.EPOLLHUP | _select.EPOLLERR):
                         poll.unregister(fd)
                         dev = fd_map.pop(fd, None)
@@ -99,7 +149,14 @@ class LinuxHotkeyImpl:
                                 dev.close()
                             except Exception:
                                 pass
+                            if dev in self._devices:
+                                self._devices.remove(dev)
+                                try:
+                                    self._device_paths.discard(dev.path)
+                                except Exception:
+                                    pass
                         continue
+
                     dev = fd_map.get(fd)
                     if dev is None:
                         continue
@@ -117,6 +174,53 @@ class LinuxHotkeyImpl:
                 except Exception:
                     pass
             self._devices.clear()
+            self._device_paths.clear()
+            if self._inotify_fd is not None:
+                try:
+                    _os.close(self._inotify_fd)
+                except Exception:
+                    pass
+                self._inotify_fd = None
+            try:
+                _os.close(self._stop_r)
+            except Exception:
+                pass
+            try:
+                _os.close(self._stop_w)
+            except Exception:
+                pass
+
+    def _handle_inotify(self, poll, fd_map):
+        try:
+            data = _os.read(self._inotify_fd, 4096)
+        except (BlockingIOError, OSError):
+            return
+
+        offset = 0
+        while offset < len(data):
+            wd, mask, cookie, name_len = struct.unpack_from("iIII", data, offset)
+            offset += _INOTIFY_EVENT_SIZE
+            name = data[offset : offset + name_len].rstrip(b"\x00").decode("utf-8", errors="replace")
+            offset += name_len
+            if not name:
+                continue
+
+            path = f"/dev/input/{name}"
+            if path in self._device_paths:
+                continue
+
+            try:
+                dev = InputDevice(path)
+                if ecodes.EV_KEY not in dev.capabilities():
+                    dev.close()
+                    return
+                _os.set_blocking(dev.fd, False)
+                self._devices.append(dev)
+                self._device_paths.add(path)
+                fd_map[dev.fd] = dev
+                poll.register(dev.fd, _select.EPOLLIN | _select.EPOLLHUP | _select.EPOLLERR)
+            except (PermissionError, OSError):
+                pass
 
     def _on_event(self, ev, mod_counts):
         code = ev.code

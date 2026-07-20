@@ -56,6 +56,7 @@ class ClickDaemon:
             adb_timeout = 5
         self.adb_connect = adb_connect
         self.adb_timeout = adb_timeout
+        self.screen_cap_timeout = max(1, min(15, adb_cfg.get("screen_cap_timeout", 15)))
 
         ensure_adb(adb_connect, timeout=adb_timeout)
 
@@ -84,8 +85,11 @@ class ClickDaemon:
         self.overlay_state = {"visible": True, "quit": False}
         self._launcher_proc = None
         self._overlay_proc = None
+        self._next_click = 0.0
 
         hk_cfg = config.get("hotkeys", {})
+        self._hotkey_actions = config.get("hotkey_actions", {})
+        self._hk_procs = {}
         self._hotkeys = None
         if hk_cfg:
             try:
@@ -178,6 +182,49 @@ class ClickDaemon:
         elif action == "burst_clicks_minus":
             self._burst_clicks_change(-1)
 
+        elif action in self._hotkey_actions:
+            ha = self._hotkey_actions[action]
+            t = ha.get("type")
+            if t == "run":
+                proc = subprocess.Popen(ha["cmd"], shell=True)
+                timeout_ms = ha.get("timeout_ms", 0)
+                if timeout_ms > 0:
+                    self._hk_procs[action] = {
+                        "proc": proc,
+                        "start": time.monotonic(),
+                        "timeout": timeout_ms / 1000.0,
+                    }
+            elif t == "mode":
+                self._switch_mode(ha.get("name"))
+
+    def _switch_mode(self, name: str) -> bool:
+        if name not in self.modes:
+            return False
+        old_method = self.method_name
+        self.mode = name
+        self.current_mode = self.modes[name]
+        self.current_mode.reset()
+        self._next_click = 0.0
+
+        mode_cfg = load_modeconfig(name)
+        new_method = mode_cfg.get("method", "adb-pipe")
+
+        if new_method != old_method:
+            result = create_injector(new_method, self.host_w, self.host_h,
+                                     shared_uinput=self._shared_uinput,
+                                     adb_connect=self.adb_connect,
+                                     adb_timeout=self.adb_timeout)
+            if result:
+                inj, actual_method = result
+                old = self.injector
+                self.injector = inj
+                self.method_name = actual_method
+                old.close()
+
+        if self._should_notify():
+            self.platform.notify(f"mode: {name}")
+        return True
+
     def _burst_clicks_change(self, delta):
         if self.mode != "follow.burst":
             return
@@ -217,8 +264,6 @@ class ClickDaemon:
         if self.active and self._should_notify():
             self.platform.notify(f"clicker active ({self.mode}, {self.method_name})")
 
-        next_click = 0.0
-
         while self.running:
             now = time.monotonic()
 
@@ -226,7 +271,7 @@ class ClickDaemon:
                 if isinstance(self.current_mode, CustomMode):
                     remaining = self.current_mode.next_time - now
                 else:
-                    remaining = next_click - now
+                    remaining = self._next_click - now
                 wait = max(0.001, min(0.05, remaining)) if remaining > 0 else 0.001
             else:
                 wait = 0.05
@@ -264,7 +309,18 @@ class ClickDaemon:
                     pass
 
             now = time.monotonic()
-            if self.active and not isinstance(self.current_mode, CustomMode) and now >= next_click:
+
+            dead = []
+            for name, hp in self._hk_procs.items():
+                if hp["proc"].poll() is not None:
+                    dead.append(name)
+                elif hp["timeout"] > 0 and now - hp["start"] >= hp["timeout"]:
+                    hp["proc"].kill()
+                    hp["proc"].wait()
+                    dead.append(name)
+            for name in dead:
+                del self._hk_procs[name]
+            if self.active and not isinstance(self.current_mode, CustomMode) and now >= self._next_click:
                 try:
                     self.current_mode.tick()
                 except Exception:
@@ -273,7 +329,7 @@ class ClickDaemon:
                 interval = self.current_mode.interval()
                 jit_ms = self.current_mode.jitter_ms()
                 jit = (random.random() - 0.5) * 2 * jit_ms / 1000.0
-                next_click = now + max(0.001, interval + jit)
+                self._next_click = now + max(0.001, interval + jit)
 
             if self.active and isinstance(self.current_mode, CustomMode):
                 while now >= self.current_mode.next_time:
@@ -282,6 +338,11 @@ class ClickDaemon:
                     except Exception:
                         pass
                     now = time.monotonic()
+
+            if self.active and not self.injector.healthy():
+                self.active = False
+                if self._should_notify():
+                    self.platform.notify("clicker stopped: ADB disconnected")
 
         self.cleanup()
 
@@ -313,33 +374,9 @@ class ClickDaemon:
             return {"ok": True, "message": "off"}
 
         if cmd == "mode":
-            mode = args.get("mode")
-            if mode not in self.modes:
-                return {"ok": False, "error": "invalid mode"}
-
-            old_method = self.method_name
-            self.mode = mode
-            self.current_mode = self.modes[mode]
-            self.current_mode.reset()
-
-            mode_cfg = load_modeconfig(mode)
-            new_method = mode_cfg.get("method", "adb-pipe")
-
-            if new_method != old_method:
-                result = create_injector(new_method, self.host_w, self.host_h,
-                                         shared_uinput=self._shared_uinput,
-                                         adb_connect=self.adb_connect,
-                                         adb_timeout=self.adb_timeout)
-                if result:
-                    inj, actual_method = result
-                    old = self.injector
-                    self.injector = inj
-                    self.method_name = actual_method
-                    old.close()
-
-            if n():
-                self.platform.notify(f"mode: {mode}")
-            return {"ok": True, "message": mode}
+            name = args.get("mode")
+            ok = self._switch_mode(name)
+            return {"ok": ok, "message": name} if ok else {"ok": False, "error": "invalid mode"}
 
         if cmd == "read_mode":
             data = load_modeconfig(args["mode"])
@@ -516,6 +553,13 @@ class ClickDaemon:
     def cleanup(self):
         if self._hotkeys:
             self._hotkeys.stop()
+        for hp in self._hk_procs.values():
+            try:
+                hp["proc"].kill()
+                hp["proc"].wait()
+            except Exception:
+                pass
+        self._hk_procs.clear()
         self._kill_proc(self._launcher_proc)
         self._kill_proc(self._overlay_proc)
         self.injector.close()

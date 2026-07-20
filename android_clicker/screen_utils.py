@@ -1,4 +1,4 @@
-import os
+import io
 import subprocess
 
 try:
@@ -54,34 +54,16 @@ def colour_in_rect(img, x, y, w, h, hex_colour, tol=15):
     return False
 
 
-def screencap_adb():
+def screencap_adb(timeout=15):
     if Image is None:
         return None
     try:
-        tmp_device = "/sdcard/._wdc_screencap.png"
-        tmp_local = f"/tmp/._wdc_screencap_{os.getpid()}.png"
-
         r = subprocess.run(
-            ["adb", "shell", f"screencap -p {tmp_device}"],
-            capture_output=True, timeout=15,
+            ["adb", "exec-out", "screencap", "-p"],
+            capture_output=True, timeout=timeout,
         )
-        if r.returncode != 0:
+        if r.returncode != 0 or not r.stdout:
             return None
-
-        r = subprocess.run(
-            ["adb", "pull", tmp_device, tmp_local],
-            capture_output=True, timeout=15,
-        )
-        subprocess.run(
-            ["adb", "shell", f"rm {tmp_device}"],
-            capture_output=True, timeout=5,
-        )
-
-        if r.returncode != 0:
-            return None
-
-        img = Image.open(tmp_local)
-        os.unlink(tmp_local)
-        return img
+        return Image.open(io.BytesIO(r.stdout))
     except Exception:
         return None

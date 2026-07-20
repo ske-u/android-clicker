@@ -7,11 +7,13 @@ from android_clicker.platform import PlatformAdapter
 class LinuxAdapter(PlatformAdapter):
     def __init__(self, config: dict | None = None):
         self._notify_backend = "hyprctl"
+        self._target_window = "Waydroid"
         if config:
             self._notify_backend = (
                 config.get("notifications", {})
                 .get("notify_backend", "hyprctl")
             )
+            self._target_window = config.get("display", {}).get("target_window", "Waydroid")
 
     def notify(self, message: str) -> None:
         if self._notify_backend == "libnotify":
@@ -32,7 +34,7 @@ class LinuxAdapter(PlatformAdapter):
             )
             for c in json.loads(r.stdout):
                 cls_ = c.get("class", "")
-                if "Waydroid" in cls_:
+                if self._target_window in cls_:
                     return c["at"][0], c["at"][1], c["size"][0], c["size"][1]
         except Exception:
             pass

@@ -1,6 +1,9 @@
+import atexit
+import queue
 import re
 import sys
 import subprocess
+import threading
 
 METHODS = ["adb-pipe", "uinput"]
 
@@ -39,6 +42,8 @@ class BaseInjector:
         raise NotImplementedError
     def close(self):
         pass
+    def healthy(self) -> bool:
+        return True
 
 
 def ensure_adb(adb_connect, timeout=5):
@@ -79,25 +84,106 @@ def get_adb_wm_size(timeout=5) -> tuple[int, int] | None:
 
 
 class AdbPipeInjector(BaseInjector):
+    _SENTINEL = b""
+
     def __init__(self, adb_connect, timeout=5):
         ensure_adb(adb_connect, timeout=timeout)
+        self._dead = False
+        self._closed = False
         self.proc = subprocess.Popen(
             ["adb", "shell"],
             stdin=subprocess.PIPE,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
         )
+        atexit.register(self.close)
+        self._queue = queue.Queue(maxsize=1000)
+        self._worker = threading.Thread(target=self._writer, daemon=True)
+        self._worker.start()
+
+    def healthy(self) -> bool:
+        return not self._dead
+
+    def _writer(self):
+        while not self._closed:
+            cmd = self._queue.get()
+            if cmd is self._SENTINEL:
+                break
+            try:
+                self.proc.stdin.write(cmd)
+            except (BrokenPipeError, OSError):
+                if self._reconnect_worker():
+                    try:
+                        self.proc.stdin.write(cmd)
+                        continue
+                    except (BrokenPipeError, OSError):
+                        pass
+                self._dead = True
+                break
+
+    def _reconnect_worker(self) -> bool:
+        try:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                self.proc.wait(timeout=3)
+        except Exception:
+            pass
+        try:
+            self.proc = subprocess.Popen(
+                ["adb", "shell"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+            return True
+        except Exception:
+            return False
 
     def tap(self, x, y):
-        cmd = f"input tap {x} {y}\n"
-        self.proc.stdin.write(cmd)
-        self.proc.stdin.flush()
+        if self._dead:
+            return
+        try:
+            self._queue.put_nowait(f"input tap {x} {y}\n".encode())
+        except queue.Full:
+            pass
+
+    def _reconnect(self):
+        self.close()
+        try:
+            self.proc = subprocess.Popen(
+                ["adb", "shell"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+            self._dead = False
+            self._closed = False
+            atexit.register(self.close)
+            self._queue = queue.Queue(maxsize=1000)
+            self._worker = threading.Thread(target=self._writer, daemon=True)
+            self._worker.start()
+        except Exception:
+            self._dead = True
 
     def close(self):
-        self.proc.terminate()
+        if self._closed:
+            return
+        self._closed = True
+        atexit.unregister(self.close)
         try:
-            self.proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
+            self._queue.put_nowait(self._SENTINEL)
+        except queue.Full:
+            pass
+        self._worker.join(timeout=3)
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
 
 class UinputInjector(BaseInjector):

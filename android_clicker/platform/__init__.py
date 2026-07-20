@@ -26,7 +26,7 @@ class PlatformAdapter(ABC):
             return LinuxAdapter(config)
         elif sys.platform == "darwin":
             from android_clicker.platform.macos import MacAdapter
-            return MacAdapter()
+            return MacAdapter(config)
         elif sys.platform == "win32":
             from android_clicker.platform.windows import WindowsAdapter
             return WindowsAdapter()

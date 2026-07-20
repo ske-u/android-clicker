@@ -10,6 +10,8 @@
 # [display]
 # android_width = 1920                 # default: autodetect
 # android_height = 1080                # default: autodetect
+# target_window = "Waydroid"           # substring match for window detection (Linux Hyprland)
+# target_process = "BlueStacks"         # exact process name for window detection (macOS)
 #
 # [notifications]
 # enabled = false
@@ -18,6 +20,7 @@
 # [adb]
 # connect = "192.168.240.112:5555"     # default: 192.168.240.112:5555 for Waydroid, 127.0.0.1:5555 for Bluestacks
 # connect_timeout = 5
+# screen_cap_timeout = 15              # timeout for screencap (1-15s, default 15)
 #
 # [hotkeys]
 # toggle_clicking = "alt+space"        # default: not set
@@ -26,6 +29,10 @@
 # overlay_toggle = "shift+h"           # default: not set
 # burst_clicks_plus = "ctrl+up"        # default: not set
 # burst_clicks_minus = "ctrl+down"     # default: not set
+#
+# [hotkey_actions]
+# run_hello = { type = "run", cmd = "notify-send hello", timeout_ms = 10000 }
+# mode_towns = { type = "mode", name = "fixed.towns" }
 
 active = false
 mode = "follow"

@@ -26,6 +26,7 @@ class CustomMode(BaseMode):
         self._repeat_jp = 0
         self._repeat_cursor = False
         self._init_screencap()
+        self._cap_timeout = getattr(self.daemon, "screen_cap_timeout", 15)
         self._run_proc = None
         self._run_start = 0.0
         self._run_timeout = 0.0
@@ -266,7 +267,7 @@ class CustomMode(BaseMode):
                 self.idx += 1
                 self._advance_next()
                 return
-            cap = screencap_adb()
+            cap = screencap_adb(timeout=self._cap_timeout)
             checks = step.get("checks")
             if checks:
                 for check in checks:

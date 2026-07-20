@@ -400,6 +400,7 @@ _CONFIG_DISPLAY_NAMES = {
     "notify_backend":    "notify backend",
     "connect":           "connect",
     "connect_timeout":   "connect timeout",
+    "screen_cap_timeout": "screencap timeout",
     "toggle_clicking":   "toggle clicking",
     "launcher":          "launcher",
     "overlay":           "overlay",
@@ -407,6 +408,8 @@ _CONFIG_DISPLAY_NAMES = {
     "burst_clicks_plus": "burst clicks +",
     "burst_clicks_minus": "burst clicks -",
     "uinput":              "uinput",
+    "target_window":       "target window (Linux)",
+    "target_process":      "target process (macOS)",
 }
 
 
@@ -425,6 +428,8 @@ class ConfigEditorWindow(QWidget):
         ("Display", [
             ("android_width", "display.android_width", "text", None),
             ("android_height", "display.android_height", "text", None),
+            ("target_window", "display.target_window", "text", None),
+            ("target_process", "display.target_process", "text", None),
         ]),
         ("Notifications", [
             ("enabled", "notifications.enabled", "combo", ["false", "true"]),
@@ -433,6 +438,7 @@ class ConfigEditorWindow(QWidget):
         ("ADB", [
             ("connect", "adb.connect", "text", None),
             ("connect_timeout", "adb.connect_timeout", "text", None),
+            ("screen_cap_timeout", "adb.screen_cap_timeout", "text", None),
         ]),
         ("Hotkeys", [
             ("toggle_clicking", "hotkeys.toggle_clicking", "text", None),
@@ -506,6 +512,7 @@ class ConfigEditorWindow(QWidget):
                         "display.android_width": "e.g. 1920  (empty = auto-detect)",
                         "display.android_height": "e.g. 1080  (empty = auto-detect)",
                         "adb.connect_timeout": "e.g. 5  (empty = default)",
+                        "adb.screen_cap_timeout": "e.g. 15  (1-15s, empty = default)",
                         "adb.connect": "e.g. 192.168.240.112:5555  (empty = auto-detect)",
                         "hotkeys.toggle_clicking": "e.g. alt+space  (empty = disabled)",
                         "hotkeys.launcher": "e.g. ctrl+alt+l  (empty = disabled)",
