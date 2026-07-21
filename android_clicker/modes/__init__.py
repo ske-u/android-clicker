@@ -26,7 +26,7 @@ BURST_TEMPLATE = """# follow.burst mode
 # Toggle on to fire another burst.
 #
 # clicks         Number of clicks per burst
-# jitter_clicks  Random offset on click count (\u00b1)
+# jitter_clicks  Random offset on click count (+/-)
 # interval       ms between clicks
 # jitter_ms      ms random offset added to interval
 # jitter_px      px random offset on x/y per click

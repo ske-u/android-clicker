@@ -8,7 +8,7 @@ import sys
 from .config import (
     load_config, list_modeconfigs, load_modeconfig, parse_value, SCRIPT_DIR,
 )
-from .daemon import ClickDaemon, SOCKET_PATH
+from .daemon import ClickDaemon, SOCKET_PATH, SOCKET_FAMILY
 from .platform import PlatformAdapter
 
 
@@ -16,7 +16,7 @@ def send_cmd(command, **kwargs):
     payload = {"cmd": command}
     if kwargs:
         payload["args"] = kwargs
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock = socket.socket(SOCKET_FAMILY, socket.SOCK_STREAM)
     sock.settimeout(5)
     sock.connect(SOCKET_PATH)
     sock.send(json.dumps(payload).encode())
@@ -321,7 +321,7 @@ def main():
     if args.command == "start":
         config = load_config()
         try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s = socket.socket(SOCKET_FAMILY, socket.SOCK_STREAM)
             s.settimeout(1)
             s.connect(SOCKET_PATH)
             s.close()
@@ -329,7 +329,7 @@ def main():
             if config.get("notifications", {}).get("enabled", False):
                 PlatformAdapter.detect().notify("daemon already running")
             sys.exit(1)
-        except (ConnectionRefusedError, FileNotFoundError):
+        except (ConnectionRefusedError, FileNotFoundError, TimeoutError):
             pass
         mode = config.get("mode", "follow")
         mode_cfg = load_modeconfig(mode)

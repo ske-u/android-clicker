@@ -15,14 +15,25 @@ from .config import (
 )
 from .injectors import (
     create_injector, create_shared_uinput, available_methods, get_adb_wm_size, ensure_adb,
+    set_adb_path, detect_adb_path, set_adb_serial,
 )
 from .hotkeys import HotkeyListener
 from .modes import create_modes
 from .modes.custom import CustomMode
 from .platform import PlatformAdapter
+from . import screen_utils
 
 
-SOCKET_PATH = "/tmp/android-clicker.sock"
+if sys.platform == "win32":
+    SOCKET_FAMILY = socket.AF_INET
+    SOCKET_PATH = ("127.0.0.1", 31985)
+    LAUNCHER_SOCKET = ("127.0.0.1", 31986)
+    OVERLAY_SOCKET = ("127.0.0.1", 31987)
+else:
+    SOCKET_FAMILY = socket.AF_UNIX
+    SOCKET_PATH = "/tmp/android-clicker.sock"
+    LAUNCHER_SOCKET = "/tmp/android-clicker-launcher.sock"
+    OVERLAY_SOCKET = "/tmp/android-clicker-overlay.sock"
 
 
 class ClickDaemon:
@@ -33,11 +44,16 @@ class ClickDaemon:
         self.mode = config.get("mode", "follow")
 
         self.platform = PlatformAdapter.detect(config)
-        res = self.platform.get_display_resolution()
-        if res is None:
-            print("error: could not determine display resolution", file=sys.stderr)
-            sys.exit(1)
-        self.host_w, self.host_h = res
+        disp = self.config.get("display", {})
+        if "host_width" in disp and "host_height" in disp:
+            self.host_w, self.host_h = disp["host_width"], disp["host_height"]
+        else:
+            res = self.platform.get_display_resolution()
+            if res is None:
+                print("error: could not determine display resolution "
+                      "(set display.host_width/height in config)", file=sys.stderr)
+                sys.exit(1)
+            self.host_w, self.host_h = res
 
         uinput_cfg = config.get("uinput", False)
         self._shared_uinput = None
@@ -58,9 +74,16 @@ class ClickDaemon:
         self.adb_timeout = adb_timeout
         self.screen_cap_timeout = max(1, min(15, adb_cfg.get("screen_cap_timeout", 15)))
 
+        adb_path = adb_cfg.get("exe_path") or detect_adb_path()
+        set_adb_path(adb_path)
+        screen_utils.set_adb_path(adb_path)
+        set_adb_serial(adb_connect)
+        screen_utils.set_adb_serial(adb_connect)
+
         ensure_adb(adb_connect, timeout=adb_timeout)
 
         self.android_w, self.android_h = self._detect_android_resolution()
+        self._update_window()
 
         mode_cfg = load_modeconfig(self.mode)
         method = mode_cfg.get("method", "adb-pipe")
@@ -86,6 +109,7 @@ class ClickDaemon:
         self._launcher_proc = None
         self._overlay_proc = None
         self._next_click = 0.0
+        self._clients: dict[socket.socket, dict] = {}
 
         hk_cfg = config.get("hotkeys", {})
         self._hotkey_actions = config.get("hotkey_actions", {})
@@ -97,11 +121,14 @@ class ClickDaemon:
             except ImportError:
                 print("hotkeys: platform listener not available", file=sys.stderr)
 
-        try:
-            os.unlink(SOCKET_PATH)
-        except FileNotFoundError:
-            pass
-        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if sys.platform != "win32":
+            try:
+                os.unlink(SOCKET_PATH)
+            except FileNotFoundError:
+                pass
+        self.server = socket.socket(SOCKET_FAMILY, socket.SOCK_STREAM)
+        if sys.platform == "win32":
+            self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(SOCKET_PATH)
         self.server.listen(5)
         self.server.setblocking(False)
@@ -276,29 +303,69 @@ class ClickDaemon:
             else:
                 wait = 0.05
 
+            read_socks = [self.server] + list(self._clients.keys())
             try:
-                r, _, _ = select.select([self.server], [], [], wait)
+                r, _, _ = select.select(read_socks, [], [], wait)
             except InterruptedError:
                 continue
 
-            if r:
-                conn, _ = self.server.accept()
-                conn.setblocking(True)
-                data = conn.recv(65536)
-                if data:
+            now = time.monotonic()
+
+            if self.server in r:
+                try:
+                    conn, _ = self.server.accept()
+                    conn.setblocking(False)
+                    self._clients[conn] = {"last_activity": now, "buffer": b""}
+                except OSError:
+                    pass
+
+            dead: list[socket.socket] = []
+            for sock in list(self._clients.keys()):
+                if sock not in r:
+                    continue
+                try:
+                    chunk = sock.recv(65536)
+                except OSError:
+                    dead.append(sock)
+                    continue
+                if not chunk:
+                    dead.append(sock)
+                    continue
+
+                entry = self._clients[sock]
+                entry["buffer"] += chunk
+                entry["last_activity"] = now
+
+                while True:
                     try:
-                        msg = json.loads(data.decode())
+                        msg, end = json.JSONDecoder().raw_decode(entry["buffer"].decode())
+                    except (json.JSONDecodeError, ValueError):
+                        break
+                    try:
                         resp = self.handle_command(msg)
-                        try:
-                            conn.send(json.dumps(resp).encode())
-                        except OSError:
-                            pass
                     except Exception as e:
-                        try:
-                            conn.send(json.dumps({"ok": False, "error": str(e)}).encode())
-                        except OSError:
-                            pass
-                conn.close()
+                        resp = {"ok": False, "error": str(e)}
+                    try:
+                        sock.sendall(json.dumps(resp).encode())
+                    except OSError:
+                        dead.append(sock)
+                        break
+                    entry["buffer"] = entry["buffer"][end:]
+
+                if len(entry["buffer"]) > 65536:
+                    dead.append(sock)
+
+            idle_cutoff = now - 60.0
+            for sock, entry in list(self._clients.items()):
+                if entry["last_activity"] < idle_cutoff:
+                    dead.append(sock)
+
+            for sock in dead:
+                self._clients.pop(sock, None)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
             if self._hotkeys:
                 try:
@@ -332,7 +399,7 @@ class ClickDaemon:
                 self._next_click = now + max(0.001, interval + jit)
 
             if self.active and isinstance(self.current_mode, CustomMode):
-                while now >= self.current_mode.next_time:
+                while self.active and now >= self.current_mode.next_time:
                     try:
                         self.current_mode.tick()
                     except Exception:
@@ -350,6 +417,9 @@ class ClickDaemon:
         cmd = msg.get("cmd")
         args = msg.get("args", {})
         n = self._should_notify
+
+        if cmd == "ping":
+            return {"ok": True}
 
         if cmd == "toggle":
             self.active = not self.active
@@ -551,6 +621,12 @@ class ClickDaemon:
         self.window_bounds = self.platform.get_window_bounds()
 
     def cleanup(self):
+        for sock in list(self._clients.keys()):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self._clients.clear()
         if self._hotkeys:
             self._hotkeys.stop()
         for hp in self._hk_procs.values():
@@ -568,7 +644,8 @@ class ClickDaemon:
             ui.close()
         if self._should_notify():
             self.platform.notify("daemon stopped")
-        try:
-            os.unlink(SOCKET_PATH)
-        except FileNotFoundError:
-            pass
+        if sys.platform != "win32":
+            try:
+                os.unlink(SOCKET_PATH)
+            except FileNotFoundError:
+                pass

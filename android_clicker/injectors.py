@@ -1,9 +1,42 @@
 import atexit
+import os
 import queue
 import re
 import sys
 import subprocess
 import threading
+
+ADB_PATH = "adb"
+ADB_SERIAL = ""
+
+def set_adb_path(v):
+    global ADB_PATH
+    ADB_PATH = v
+
+def set_adb_serial(v):
+    global ADB_SERIAL
+    ADB_SERIAL = v
+
+def _adb_cmd(*args):
+    cmd = [ADB_PATH]
+    if ADB_SERIAL:
+        cmd += ["-s", ADB_SERIAL]
+    cmd += list(args)
+    return cmd
+
+def detect_adb_path():
+    if sys.platform != "win32":
+        return "adb"
+    candidates = [
+        os.environ.get("PROGRAMFILES", "C:\\Program Files"),
+        os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)"),
+    ]
+    for base in candidates:
+        for variant in ("BlueStacks_nxt", "BlueStacks"):
+            path = os.path.join(base, variant, "HD-Adb.exe")
+            if os.path.exists(path):
+                return path
+    return "adb"
 
 METHODS = ["adb-pipe", "uinput"]
 
@@ -48,7 +81,7 @@ class BaseInjector:
 
 def ensure_adb(adb_connect, timeout=5):
     try:
-        r = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run([ADB_PATH, "devices"], capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
         print("error: adb not found (install android-tools-adb)", file=sys.stderr)
         return False
@@ -58,8 +91,8 @@ def ensure_adb(adb_connect, timeout=5):
     if any("device" in l and "offline" not in l for l in lines):
         return True
 
-    subprocess.run(["adb", "connect", adb_connect], capture_output=True, timeout=timeout)
-    r = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=timeout)
+    subprocess.run([ADB_PATH, "connect", adb_connect], capture_output=True, timeout=timeout)
+    r = subprocess.run([ADB_PATH, "devices"], capture_output=True, text=True, timeout=timeout)
     lines = [l.strip() for l in r.stdout.strip().split("\n")
              if l.strip() and not l.startswith("*") and "List" not in l]
     ok = any("device" in l and "offline" not in l for l in lines)
@@ -72,7 +105,7 @@ def get_adb_wm_size(timeout=5) -> tuple[int, int] | None:
     """Run `adb shell wm size` and return (width, height) or None."""
     try:
         r = subprocess.run(
-            ["adb", "shell", "wm size"],
+            _adb_cmd("shell", "wm size"),
             capture_output=True, text=True, timeout=timeout,
         )
         m = re.search(r"Physical size:\s*(\d+)x(\d+)", r.stdout)
@@ -91,7 +124,7 @@ class AdbPipeInjector(BaseInjector):
         self._dead = False
         self._closed = False
         self.proc = subprocess.Popen(
-            ["adb", "shell"],
+            _adb_cmd("shell"),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -131,7 +164,7 @@ class AdbPipeInjector(BaseInjector):
             pass
         try:
             self.proc = subprocess.Popen(
-                ["adb", "shell"],
+                _adb_cmd("shell"),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -153,7 +186,7 @@ class AdbPipeInjector(BaseInjector):
         self.close()
         try:
             self.proc = subprocess.Popen(
-                ["adb", "shell"],
+                _adb_cmd("shell"),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

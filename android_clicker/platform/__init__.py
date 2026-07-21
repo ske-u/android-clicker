@@ -29,5 +29,5 @@ class PlatformAdapter(ABC):
             return MacAdapter(config)
         elif sys.platform == "win32":
             from android_clicker.platform.windows import WindowsAdapter
-            return WindowsAdapter()
+            return WindowsAdapter(config)
         raise RuntimeError(f"unsupported platform: {sys.platform}")

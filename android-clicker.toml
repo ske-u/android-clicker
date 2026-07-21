@@ -10,8 +10,9 @@
 # [display]
 # android_width = 1920                 # default: autodetect
 # android_height = 1080                # default: autodetect
-# target_window = "Waydroid"           # substring match for window detection (Linux Hyprland)
-# target_process = "BlueStacks"         # exact process name for window detection (macOS)
+# host_width = 1920                    # default: autodetect
+# host_height = 1080                   # default: autodetect
+# target_app = "Waydroid"              # window/process name for window detection, default: autodetect
 #
 # [notifications]
 # enabled = false
@@ -21,6 +22,7 @@
 # connect = "192.168.240.112:5555"     # default: 192.168.240.112:5555 for Waydroid, 127.0.0.1:5555 for Bluestacks
 # connect_timeout = 5
 # screen_cap_timeout = 15              # timeout for screencap (1-15s, default 15)
+# exe_path = "C:\\Program Files\\BlueStacks_nxt\\HD-Adb.exe"  # Windows only: custom ADB binary path
 #
 # [hotkeys]
 # toggle_clicking = "alt+space"        # default: not set

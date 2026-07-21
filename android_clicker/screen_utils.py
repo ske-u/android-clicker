@@ -1,6 +1,24 @@
 import io
 import subprocess
 
+ADB_PATH = "adb"
+ADB_SERIAL = ""
+
+def set_adb_path(v):
+    global ADB_PATH
+    ADB_PATH = v
+
+def set_adb_serial(v):
+    global ADB_SERIAL
+    ADB_SERIAL = v
+
+def _adb_cmd(*args):
+    cmd = [ADB_PATH]
+    if ADB_SERIAL:
+        cmd += ["-s", ADB_SERIAL]
+    cmd += list(args)
+    return cmd
+
 try:
     from PIL import Image
 except ImportError:
@@ -59,7 +77,7 @@ def screencap_adb(timeout=15):
         return None
     try:
         r = subprocess.run(
-            ["adb", "exec-out", "screencap", "-p"],
+            _adb_cmd("shell", "screencap", "-p"),
             capture_output=True, timeout=timeout,
         )
         if r.returncode != 0 or not r.stdout:

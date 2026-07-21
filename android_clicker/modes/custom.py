@@ -1,3 +1,4 @@
+import math
 import random
 import subprocess
 import sys
@@ -25,12 +26,23 @@ class CustomMode(BaseMode):
         self._repeat_jit_ms = 0
         self._repeat_jp = 0
         self._repeat_cursor = False
+        self._repeat_area = False
+        self._repeat_cx = 0
+        self._repeat_cy = 0
+        self._repeat_w = 100
+        self._repeat_h = 100
+        self._repeat_angle = 0
+        self._repeat_min_dist = 0
+        self._repeat_unique = False
+        self._repeat_positions = None
+        self._repeat_prev = None
         self._init_screencap()
         self._cap_timeout = getattr(self.daemon, "screen_cap_timeout", 15)
         self._run_proc = None
         self._run_start = 0.0
         self._run_timeout = 0.0
         self._zoom_state = None
+        self._then_idx = None
 
     def _get_config(self):
         if self.mode_data is not None:
@@ -60,7 +72,11 @@ class CustomMode(BaseMode):
         self._run_mode_target = None
         self._repeat_remaining = 0
         self._repeat_cursor = False
+        self._repeat_area = False
+        self._repeat_positions = None
+        self._repeat_prev = None
         self._zoom_state = None
+        self._then_idx = None
         if self._run_proc is not None:
             self._run_proc.kill()
             self._run_proc.wait()
@@ -88,6 +104,21 @@ class CustomMode(BaseMode):
             x, y = self.daemon._android_to_host(x, y)
         self.injector.tap(max(0, x), max(0, y))
 
+    def _rand_point_in_area(self, cx, cy, w, h, angle_deg):
+        u = random.uniform(-w / 2, w / 2)
+        v = random.uniform(-h / 2, h / 2)
+        cr = math.cos(math.radians(angle_deg))
+        sr = math.sin(math.radians(angle_deg))
+        return cx + u * cr - v * sr, cy + u * sr + v * cr
+
+    def _advance_idx(self, then=None):
+        if then is not None and then >= 0:
+            self.idx = then
+        elif self._then_idx is not None and self._then_idx >= 0:
+            self.idx = self._then_idx
+            self._then_idx = None
+        else:
+            self.idx += 1
 
     def tick(self):
         now = time.monotonic()
@@ -100,7 +131,7 @@ class CustomMode(BaseMode):
                 self._run_mode_target = None
                 self._run_mode_key = None
                 self._saved_cfg = None
-                self.idx += 1
+                self._advance_idx()
                 self._advance_next()
                 return
             else:
@@ -115,13 +146,13 @@ class CustomMode(BaseMode):
             ret = self._run_proc.poll()
             if ret is not None:
                 self._run_proc = None
-                self.idx += 1
+                self._advance_idx()
                 self._advance_next()
             elif self._run_timeout > 0 and now - self._run_start >= self._run_timeout:
                 self._run_proc.kill()
                 self._run_proc.wait()
                 self._run_proc = None
-                self.idx += 1
+                self._advance_idx()
                 self._advance_next()
             else:
                 self.next_time = now + 0.05
@@ -153,7 +184,7 @@ class CustomMode(BaseMode):
                 ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
                 ui.syn()
                 self._zoom_state = None
-                self.idx += 1
+                self._advance_idx()
                 self._advance_next()
             else:
                 self.next_time = now + zs["step_delay"]
@@ -163,7 +194,31 @@ class CustomMode(BaseMode):
         seq = cfg.get("sequence", [])
 
         if self._repeat_remaining > 0:
-            if self._repeat_cursor:
+            if self._repeat_area:
+                rx, ry = self._rand_point_in_area(
+                    self._repeat_cx, self._repeat_cy,
+                    self._repeat_w, self._repeat_h,
+                    self._repeat_angle,
+                )
+                ok = True
+                if self._repeat_unique and self._repeat_positions is not None:
+                    if (int(rx), int(ry)) in self._repeat_positions:
+                        ok = False
+                if ok and self._repeat_min_dist > 0 and self._repeat_prev is not None:
+                    dx = rx - self._repeat_prev[0]
+                    dy = ry - self._repeat_prev[1]
+                    if dx * dx + dy * dy < self._repeat_min_dist * self._repeat_min_dist:
+                        ok = False
+                if not ok:
+                    self._repeat_unique = False
+                    self._repeat_positions = None
+                    self._repeat_min_dist = 0
+                else:
+                    if self._repeat_positions is not None:
+                        self._repeat_positions.add((int(rx), int(ry)))
+                    self._repeat_prev = (rx, ry)
+                self._click_at(rx, ry, self._repeat_jp)
+            elif self._repeat_cursor:
                 x, y = self._repeat_x, self._repeat_y
                 if self._repeat_jp:
                     x += random.randint(-self._repeat_jp, self._repeat_jp)
@@ -176,7 +231,7 @@ class CustomMode(BaseMode):
                 jit = (random.random() - 0.5) * 2 * self._repeat_jit_ms / 1000.0
                 self.next_time = now + max(0.001, self._repeat_interval / 1000.0 + jit)
             else:
-                self.idx += 1
+                self._advance_idx()
                 self._advance_next()
             return
 
@@ -192,11 +247,17 @@ class CustomMode(BaseMode):
         action = step.get("action")
 
         if action == "click":
+            if "x" not in step or "y" not in step:
+                print("skip click: missing x/y")
+                self._advance_idx(step.get("then"))
+                self._advance_next()
+                return
             clicks = step.get("clicks", 1)
             click_jp = step.get("jitter_px", cfg.get("jitter_px", 0))
             click_interval = step.get("interval", cfg.get("interval", 200))
             click_jit_ms = step.get("jitter_ms", cfg.get("jitter_ms", 5))
             if clicks > 1:
+                self._then_idx = step.get("then")
                 self._repeat_x = step.get("x", 0)
                 self._repeat_y = step.get("y", 0)
                 self._repeat_jp = click_jp
@@ -208,7 +269,7 @@ class CustomMode(BaseMode):
                 self.next_time = now + max(0.001, click_interval / 1000.0 + jit)
             else:
                 self._click_at(step.get("x", 0), step.get("y", 0), click_jp)
-                self.idx += 1
+                self._advance_idx(step.get("then"))
                 self._advance_next()
 
         elif action == "click_cursor":
@@ -224,12 +285,13 @@ class CustomMode(BaseMode):
             else:
                 coords = self.daemon._translate(host_x, host_y)
                 if coords is None:
-                    self.idx += 1
+                    self._advance_idx(step.get("then"))
                     self._advance_next()
                     return
                 base_x, base_y = coords
 
             if clicks > 1:
+                self._then_idx = step.get("then")
                 self._repeat_x = base_x
                 self._repeat_y = base_y
                 self._repeat_jp = click_jp
@@ -250,21 +312,77 @@ class CustomMode(BaseMode):
                     x += random.randint(-click_jp, click_jp)
                     y += random.randint(-click_jp, click_jp)
                 self.injector.tap(max(0, x), max(0, y))
-                self.idx += 1
+                self._advance_idx(step.get("then"))
+                self._advance_next()
+
+        elif action == "area":
+            if "x" not in step or "y" not in step or "w" not in step or "h" not in step:
+                print("skip area: missing x/y/w/h")
+                self._advance_idx(step.get("then"))
+                self._advance_next()
+                return
+            clicks = step.get("clicks", 1)
+            click_jp = step.get("jitter_px", cfg.get("jitter_px", 0))
+            click_interval = step.get("interval", cfg.get("interval", 200))
+            click_jit_ms = step.get("jitter_ms", cfg.get("jitter_ms", 5))
+            cx = step.get("x", 0)
+            cy = step.get("y", 0)
+            w = step.get("w", 100)
+            h = step.get("h", 100)
+            angle = step.get("angle", 0)
+            min_dist = step.get("min_dist", 0)
+            unique = step.get("unique", False)
+
+            if clicks > 1:
+                self._then_idx = step.get("then")
+                self._repeat_cx = cx
+                self._repeat_cy = cy
+                self._repeat_w = w
+                self._repeat_h = h
+                self._repeat_angle = angle
+                self._repeat_jp = click_jp
+                self._repeat_interval = click_interval
+                self._repeat_jit_ms = click_jit_ms
+                self._repeat_min_dist = min_dist
+                self._repeat_unique = unique
+                self._repeat_area = True
+                self._repeat_positions = set() if unique else None
+                self._repeat_prev = None
+                rx, ry = self._rand_point_in_area(cx, cy, w, h, angle)
+                if self._repeat_positions is not None:
+                    self._repeat_positions.add((int(rx), int(ry)))
+                self._repeat_prev = (rx, ry)
+                self._click_at(rx, ry, click_jp)
+                self._repeat_remaining = clicks - 1
+                if self._repeat_remaining > 0:
+                    jit = (random.random() - 0.5) * 2 * click_jit_ms / 1000.0
+                    self.next_time = now + max(0.001, click_interval / 1000.0 + jit)
+                else:
+                    self._advance_idx(step.get("then"))
+                    self._advance_next()
+            else:
+                rx, ry = self._rand_point_in_area(cx, cy, w, h, angle)
+                self._click_at(rx, ry, click_jp)
+                self._advance_idx(step.get("then"))
                 self._advance_next()
 
         elif action == "wait":
-            self.idx += 1
             ms = step.get("ms", 1000)
             wj = step.get("wait_jitter", cfg.get("wait_jitter", 0))
             if wj:
                 jit = (random.random() - 0.5) * 2 * wj
                 ms = max(0, ms + jit)
+            self._advance_idx(step.get("then"))
             self._advance_next(wait_ms=ms)
 
         elif action == "screencap_check":
             if not cfg.get("screen_cap"):
-                self.idx += 1
+                self._advance_idx(step.get("then"))
+                self._advance_next()
+                return
+            if "x" not in step or "y" not in step or "w" not in step or "h" not in step:
+                print("skip screencap_check: missing x/y/w/h")
+                self._advance_idx(step.get("then"))
                 self._advance_next()
                 return
             cap = screencap_adb(timeout=self._cap_timeout)
@@ -279,7 +397,7 @@ class CustomMode(BaseMode):
                         check.get("tol", 15),
                     ):
                         then = check.get("then")
-                        self.idx = then if then is not None else self.idx + 1
+                        self.idx = then if then is not None and then >= 0 else self.idx + 1
                         break
                 else:
                     else_idx = step.get("else", -1)
@@ -292,20 +410,24 @@ class CustomMode(BaseMode):
                     step.get("colour", "000000"),
                     step.get("tol", 15),
                 ):
-                    self.idx = step.get("then", 0)
+                    then = step.get("then")
+                    self.idx = then if then is not None and then >= 0 else self.idx + 1
                 else:
                     else_idx = step.get("else", -1)
                     self.idx = else_idx if else_idx >= 0 else self.idx + 1
             self._advance_next()
 
+        elif action == "stop":
+            self.daemon.active = False
+
         elif action == "notify":
             self.daemon.platform.notify(step.get("message", ""))
-            self.idx += 1
+            self._advance_idx(step.get("then"))
             self._advance_next()
 
         elif action == "log":
             print(step.get("message", ""))
-            self.idx += 1
+            self._advance_idx(step.get("then"))
             self._advance_next()
 
         elif action == "run":
@@ -317,15 +439,16 @@ class CustomMode(BaseMode):
                 elif isinstance(cmd, str):
                     proc = subprocess.Popen(cmd, shell=True)
                 else:
-                    self.idx += 1
+                    self._advance_idx(step.get("then"))
                     self._advance_next()
                     return
+                self._then_idx = step.get("then")
                 self._run_proc = proc
                 self._run_start = now
                 self._run_timeout = timeout_ms / 1000.0
             except Exception as e:
                 print(f"run error: {e}", file=sys.stderr)
-                self.idx += 1
+                self._advance_idx(step.get("then"))
                 self._advance_next()
             return
 
@@ -334,6 +457,7 @@ class CustomMode(BaseMode):
             if target_name and target_name != self.name:
                 target = self.daemon.modes.get(target_name)
                 if target:
+                    self._then_idx = step.get("then")
                     self._run_mode_target = target
                     dur = step.get("duration_ms", 0)
                     self._run_mode_end = float('inf') if dur <= 0 else now + dur / 1000.0
@@ -348,15 +472,21 @@ class CustomMode(BaseMode):
 
                     return
 
-            self.idx += 1
+            self._advance_idx(step.get("then"))
             self._advance_next()
 
         elif action == "zoom":
-            shared = self.daemon._shared_uinput
-            if shared is None:
-                self.idx += 1
+            if "x" not in step or "y" not in step:
+                print("skip zoom: missing x/y")
+                self._advance_idx(step.get("then"))
                 self._advance_next()
                 return
+            shared = self.daemon._shared_uinput
+            if shared is None:
+                self._advance_idx(step.get("then"))
+                self._advance_next()
+                return
+            self._then_idx = step.get("then")
             x = step.get("x", 0)
             y = step.get("y", 0)
             start_pct = max(5, min(95, step.get("start", 10)))
@@ -391,7 +521,7 @@ class CustomMode(BaseMode):
             self.next_time = now + step_delay
 
         else:
-            self.idx += 1
+            self._advance_idx(step.get("then"))
             self._advance_next()
 
         if self.idx >= len(seq):

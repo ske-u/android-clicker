@@ -43,30 +43,39 @@ def load_modeconfig(name):
     return {}
 
 
-def _toml_dumps(data):
-    lines = []
-    for k, v in data.items():
-        if isinstance(v, list) and k in ("sequence", "points"):
-            continue
-        lines.append(f"{k} = {_toml_val(v)}")
-    for array_key in ("points", "sequence"):
-        arr = data.get(array_key, [])
-        if arr:
-            lines.append(f"{array_key} = [")
-            for item in arr:
-                items = ", ".join(f"{sk} = {_toml_val(sv)}" for sk, sv in item.items())
-                lines.append(f"  {{ {items} }},")
-            lines.append("]")
-        elif array_key in data:
-            lines.append(f"{array_key} = []")
-    return "\n".join(lines) + "\n"
+def _to_tomlkit(v):
+    import tomlkit
+    if isinstance(v, dict):
+        t = tomlkit.inline_table()
+        for k, val in v.items():
+            t[k] = _to_tomlkit(val)
+        return t
+    if isinstance(v, list):
+        arr = tomlkit.array()
+        for item in v:
+            arr.append(_to_tomlkit(item))
+        if v:
+            arr.multiline(True)
+        return arr
+    return v
 
 
 def save_modeconfig(name, data):
-    os.makedirs(MODECONFIG_DIR, exist_ok=True)
+    import tomlkit
+
     path = os.path.join(MODECONFIG_DIR, f"{name}.toml")
+    if os.path.exists(path):
+        with open(path) as f:
+            cfg = tomlkit.parse(f.read())
+    else:
+        cfg = tomlkit.document()
+
+    for k, v in data.items():
+        cfg[k] = _to_tomlkit(v)
+
+    os.makedirs(MODECONFIG_DIR, exist_ok=True)
     with open(path, "w") as f:
-        f.write(_toml_dumps(data))
+        f.write(tomlkit.dumps(cfg))
 
 
 def save_config(data):
@@ -104,34 +113,17 @@ def save_config(data):
         f.write(tomlkit.dumps(cfg))
 
 
-def _toml_val(v):
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
-        return str(v)
-    if isinstance(v, str):
-        return f'"{v}"'
-    if isinstance(v, dict):
-        items = ", ".join(f"{k} = {_toml_val(val)}" for k, val in v.items())
-        return "{" + items + "}"
-    if isinstance(v, list):
-        return "[" + ", ".join(_toml_val(x) for x in v) + "]"
-    return str(v)
-
-
 FIXED_CREATE_TEMPLATE = """\
 method = "adb-pipe"                                                                                          # Injection backend: adb-pipe or uinput
 interval = 15                                                                                                # ms between clicks
 jitter_px = 5                                                                                                # random offset on click x/y
 jitter_ms = 5                                                                                                # random offset on interval
-reset_timer = 10000                                                                                          # ms before cycling back to first point
+reset_timer = 10000                                                                                          # ms before cycling back to first point (stop timer when repeat=false)
 jitter_timer = 250                                                                                           # random offset on reset_timer
-cycle = true                                                                                                 # cycle through points
 cycle_mode = "clicks"                                                                                        # clicks or time
 cycle_clicks = 4                                                                                             # clicks per point before cycling
 jitter_clicks = 1                                                                                            # random offset on cycle_clicks
+repeat = true                                                                                                # restart cycling when finished
 cycle_delay = 15                                                                                             # ms before advancing to next point (when cycle_mode = "time")
 points = [
   { x = 400, y = 400, clicks = 3 },                                                                          # 3 taps before cycling
