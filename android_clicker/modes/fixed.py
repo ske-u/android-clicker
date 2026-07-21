@@ -29,11 +29,16 @@ class FixedMode(BaseMode):
         if not points:
             return
 
+        repeat = self.config.get("repeat", True)
+
         reset_timer = self.config.get("reset_timer", 0)
         if reset_timer > 0:
             jt = self.config.get("jitter_timer", 0)
             effective = max(0.001, (reset_timer + random.uniform(-jt, jt)) / 1000.0)
             if time.monotonic() - self.reset_timer_start >= effective:
+                if not repeat:
+                    self.daemon.active = False
+                    return
                 self.idx = 0
                 self.clicks_this_point = 0
                 self.reset_timer_start = time.monotonic()
@@ -54,7 +59,7 @@ class FixedMode(BaseMode):
         else:
             self.injector.tap(max(0, x), max(0, y))
 
-        if self.config.get("cycle", False) and len(points) > 1:
+        if len(points) > 1:
             if self.config.get("cycle_mode") == "clicks":
                 self.clicks_this_point += 1
                 point_clicks = p.get("clicks")
@@ -77,3 +82,10 @@ class FixedMode(BaseMode):
                     self.last_point_switch = now
                     if self.idx == 0:
                         self.reset_timer_start = time.monotonic()
+
+        if not repeat:
+            if len(points) > 1:
+                if self.idx == 0 and idx == len(points) - 1:
+                    self.daemon.active = False
+            else:
+                self.daemon.active = False

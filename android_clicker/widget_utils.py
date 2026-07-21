@@ -6,7 +6,7 @@ import sys
 from PyQt6.QtCore import QEvent, QObject, Qt
 from PyQt6.QtWidgets import QWidget
 
-from .daemon import SOCKET_PATH as DAEMON_SOCKET
+from .daemon import SOCKET_PATH as DAEMON_SOCKET, SOCKET_FAMILY
 
 
 DARK_QSS = """
@@ -102,7 +102,7 @@ DARK_QSS = """
     }
 """
 
-SEND_CMD_TIMEOUT = 3.0
+SEND_CMD_TIMEOUT = 1.0
 
 
 def send_cmd(cmd, **kwargs):
@@ -111,7 +111,7 @@ def send_cmd(cmd, **kwargs):
         payload["args"] = kwargs
     sock = None
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock = socket.socket(SOCKET_FAMILY, socket.SOCK_STREAM)
         sock.settimeout(SEND_CMD_TIMEOUT)
         sock.connect(DAEMON_SOCKET)
         sock.send(json.dumps(payload).encode())
@@ -124,14 +124,60 @@ def send_cmd(cmd, **kwargs):
             sock.close()
 
 
-def singleton_lock(socket_path, name):
+class DaemonClient:
+    def __init__(self, timeout=1.0):
+        self._timeout = timeout
+        self._sock = None
+
+    def _ensure_connected(self):
+        if self._sock is not None:
+            return True
+        try:
+            self._sock = socket.socket(SOCKET_FAMILY, socket.SOCK_STREAM)
+            self._sock.settimeout(self._timeout)
+            self._sock.connect(DAEMON_SOCKET)
+            return True
+        except Exception:
+            self._sock = None
+            return False
+
+    def send(self, cmd, **kwargs):
+        payload = {"cmd": cmd}
+        if kwargs:
+            payload["args"] = kwargs
+        if self._sock is None and not self._ensure_connected():
+            return None
+        try:
+            self._sock.send(json.dumps(payload).encode())
+            return json.loads(self._sock.recv(65536).decode())
+        except Exception:
+            self.close()
+            if not self._ensure_connected():
+                return None
+            try:
+                self._sock.send(json.dumps(payload).encode())
+                return json.loads(self._sock.recv(65536).decode())
+            except Exception:
+                return None
+
+    def close(self):
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+
+def singleton_lock(socket_addr, name):
+    if sys.platform != "win32":
+        try:
+            os.unlink(socket_addr)
+        except FileNotFoundError:
+            pass
+    lock = socket.socket(SOCKET_FAMILY, socket.SOCK_STREAM)
     try:
-        os.unlink(socket_path)
-    except FileNotFoundError:
-        pass
-    lock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        lock.bind(socket_path)
+        lock.bind(socket_addr)
         lock.listen(1)
     except OSError:
         print(f"{name} already running", file=sys.stderr)

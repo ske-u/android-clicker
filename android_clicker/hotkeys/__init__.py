@@ -11,6 +11,7 @@ def parse_combo(s):
     mods = set()
     key = None
     for p in parts:
+        p = p.strip()
         if not p:
             continue
         if p in _MOD_NAMES:

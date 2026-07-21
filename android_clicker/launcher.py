@@ -17,7 +17,8 @@ except ImportError:
 
 from .config import load_config, parse_value, save_config, list_modeconfigs
 
-from .widget_utils import DARK_QSS, disable_right_click, send_cmd, singleton_lock
+from .daemon import LAUNCHER_SOCKET, SOCKET_FAMILY
+from .widget_utils import DARK_QSS, DaemonClient, disable_right_click, send_cmd, singleton_lock
 
 
 def _get_nested(d, path, default=None):
@@ -36,12 +37,7 @@ def _set_nested(d, path, value):
     d[parts[-1]] = value
 
 
-LAUNCHER_SOCKET = "/tmp/android-clicker-launcher.sock"
-DAEMON_READY_TIMEOUT = 3.0
-
-
-def _daemon_running():
-    return send_cmd("ping") is not None
+DAEMON_READY_TIMEOUT = 5.0
 
 
 def _status_color(running):
@@ -57,6 +53,7 @@ class LauncherWindow(QWidget):
         self._daemon_starting = False
         self._daemon_start_time = 0.0
         self._drag_pos = None
+        self._dc = DaemonClient(timeout=1.0)
 
         self._init_ui()
         self._update_overlay(False)
@@ -70,7 +67,7 @@ class LauncherWindow(QWidget):
 
         cfg = load_config()
         if cfg.get("launcher", {}).get("auto_start_daemon", False):
-            if not _daemon_running():
+            if not self._dc.send("ping"):
                 self._start_daemon()
 
     def _init_ui(self):
@@ -254,11 +251,12 @@ class LauncherWindow(QWidget):
     def _poll(self):
         now = time.monotonic()
         if self._daemon_starting:
-            if _daemon_running():
+            if self._dc.send("ping"):
                 self._daemon_starting = False
                 self._update_daemon(True)
                 self._daemon_btn.setEnabled(True)
-            elif now - self._daemon_start_time > DAEMON_READY_TIMEOUT:
+                return
+            if now - self._daemon_start_time > DAEMON_READY_TIMEOUT:
                 self._daemon_starting = False
                 if self._daemon_proc and self._daemon_proc.poll() is None:
                     self._daemon_proc.terminate()
@@ -271,29 +269,21 @@ class LauncherWindow(QWidget):
                 self._daemon_status.setText("Failed")
                 self._daemon_btn.setText("Start")
                 self._daemon_btn.setEnabled(True)
-            else:
-                return
+            return
 
-        running = _daemon_running()
-        if running:
-            resp = send_cmd("cursor_pos")
-            if resp and resp.get("ok"):
-                self._update_from_status(resp["data"])
-            else:
-                self._update_daemon(False)
+        resp = self._dc.send("cursor_pos")
+        if resp and resp.get("ok"):
+            self._update_from_status(resp["data"])
         else:
             self._update_daemon(False)
 
     def _toggle_daemon(self):
-        if _daemon_running():
+        if self._dc.send("ping"):
             self._stop_daemon()
         else:
             self._start_daemon()
 
     def _start_daemon(self):
-        if _daemon_running():
-            self._update_daemon(True)
-            return
         self._daemon_proc = subprocess.Popen(
             [sys.executable, "-m", "android_clicker.cli", "start"],
             stdout=subprocess.DEVNULL,
@@ -320,7 +310,7 @@ class LauncherWindow(QWidget):
         self._update_daemon(False)
 
     def _toggle_overlay(self):
-        if not _daemon_running():
+        if not self._dc.send("ping"):
             self._overlay_status.setText("Need daemon")
             return
         if self._overlay_running:
@@ -342,18 +332,16 @@ class LauncherWindow(QWidget):
             )
 
     def _on_mode_changed(self, name):
-        if name and _daemon_running():
+        if name and self._dc.send("ping"):
             send_cmd("mode", mode=name)
 
     def _update_all(self):
         self._populate_modes()
-        running = _daemon_running()
-        if running:
-            resp = send_cmd("cursor_pos")
-            if resp and resp.get("ok"):
-                self._update_from_status(resp["data"])
-                return
-        self._update_daemon(running)
+        resp = self._dc.send("cursor_pos")
+        if resp and resp.get("ok"):
+            self._update_from_status(resp["data"])
+            return
+        self._update_daemon(False)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -374,6 +362,7 @@ class LauncherWindow(QWidget):
 
     def closeEvent(self, event):
         self._timer.stop()
+        self._dc.close()
         event.accept()
 
     def keyPressEvent(self, event):
@@ -396,11 +385,14 @@ _CONFIG_DISPLAY_NAMES = {
     "mode":              "mode",
     "android_width":     "android width",
     "android_height":    "android height",
+    "host_width":        "host width",
+    "host_height":       "host height",
     "enabled":           "enabled",
     "notify_backend":    "notify backend",
     "connect":           "connect",
     "connect_timeout":   "connect timeout",
     "screen_cap_timeout": "screencap timeout",
+    "exe_path":            "ADB exe path",
     "toggle_clicking":   "toggle clicking",
     "launcher":          "launcher",
     "overlay":           "overlay",
@@ -408,8 +400,7 @@ _CONFIG_DISPLAY_NAMES = {
     "burst_clicks_plus": "burst clicks +",
     "burst_clicks_minus": "burst clicks -",
     "uinput":              "uinput",
-    "target_window":       "target window (Linux)",
-    "target_process":      "target process (macOS)",
+    "target_app":          "target app",
 }
 
 
@@ -428,8 +419,9 @@ class ConfigEditorWindow(QWidget):
         ("Display", [
             ("android_width", "display.android_width", "text", None),
             ("android_height", "display.android_height", "text", None),
-            ("target_window", "display.target_window", "text", None),
-            ("target_process", "display.target_process", "text", None),
+            ("host_width", "display.host_width", "text", None),
+            ("host_height", "display.host_height", "text", None),
+            ("target_app", "display.target_app", "text", None),
         ]),
         ("Notifications", [
             ("enabled", "notifications.enabled", "combo", ["false", "true"]),
@@ -439,6 +431,7 @@ class ConfigEditorWindow(QWidget):
             ("connect", "adb.connect", "text", None),
             ("connect_timeout", "adb.connect_timeout", "text", None),
             ("screen_cap_timeout", "adb.screen_cap_timeout", "text", None),
+            ("exe_path", "adb.exe_path", "text", None),
         ]),
         ("Hotkeys", [
             ("toggle_clicking", "hotkeys.toggle_clicking", "text", None),
@@ -455,7 +448,7 @@ class ConfigEditorWindow(QWidget):
         self._drag_pos = None
         self.setWindowTitle("android-clicker config")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setMinimumSize(455, 700)
+        self.setMinimumSize(500, 800)
         self.setStyleSheet(DARK_QSS)
 
         layout = QVBoxLayout(self)
@@ -508,21 +501,28 @@ class ConfigEditorWindow(QWidget):
                     disable_right_click(w)
                 elif wtype == "text":
                     w = QLineEdit()
-                    ph = {
-                        "display.android_width": "e.g. 1920  (empty = auto-detect)",
-                        "display.android_height": "e.g. 1080  (empty = auto-detect)",
-                        "adb.connect_timeout": "e.g. 5  (empty = default)",
-                        "adb.screen_cap_timeout": "e.g. 15  (1-15s, empty = default)",
-                        "adb.connect": "e.g. 192.168.240.112:5555  (empty = auto-detect)",
-                        "hotkeys.toggle_clicking": "e.g. alt+space  (empty = disabled)",
-                        "hotkeys.launcher": "e.g. ctrl+alt+l  (empty = disabled)",
-                        "hotkeys.overlay": "e.g. meta+o  (empty = disabled)",
-                        "hotkeys.overlay_toggle": "e.g. shift+h  (empty = disabled)",
-                        "hotkeys.burst_clicks_plus": "e.g. ctrl+up  (empty = disabled)",
-                        "hotkeys.burst_clicks_minus": "e.g. ctrl+down  (empty = disabled)",
-                    }.get(path, "")
-                    if ph:
-                        w.setPlaceholderText(ph)
+                    if sys.platform != "win32" and path == "adb.exe_path":
+                        w.setPlaceholderText("Windows-only setting")
+                        w.setEnabled(False)
+                    else:
+                        ph = {
+                            "display.android_width": "e.g. 1920  (empty = auto-detect)",
+                            "display.android_height": "e.g. 1080  (empty = auto-detect)",
+                            "display.host_width": "e.g. 1920  (empty = auto-detect)",
+                            "display.host_height": "e.g. 1080  (empty = auto-detect)",
+                            "display.target_app": "e.g. Waydroid (empty = auto-detect)",
+                            "adb.connect_timeout": "e.g. 5  (empty = default)",
+                            "adb.screen_cap_timeout": "e.g. 15  (1-15s, empty = default)",
+                            "adb.connect": "e.g. 192.168.240.112:5555  (empty = auto-detect)",
+                            "hotkeys.toggle_clicking": "e.g. alt+space  (empty = disabled)",
+                            "hotkeys.launcher": "e.g. ctrl+alt+l  (empty = disabled)",
+                            "hotkeys.overlay": "e.g. meta+o  (empty = disabled)",
+                            "hotkeys.overlay_toggle": "e.g. shift+h  (empty = disabled)",
+                            "hotkeys.burst_clicks_plus": "e.g. ctrl+up  (empty = disabled)",
+                            "hotkeys.burst_clicks_minus": "e.g. ctrl+down  (empty = disabled)",
+                        }.get(path, "")
+                        if ph:
+                            w.setPlaceholderText(ph)
                     disable_right_click(w)
                 row.addWidget(w, stretch=1)
                 form.addLayout(row)
@@ -612,7 +612,7 @@ class ConfigEditorWindow(QWidget):
                 v = parse_value(v)
             _set_nested(data, path, v)
         save_config(data)
-        if _daemon_running():
+        if send_cmd("ping"):
             send_cmd("stop")
             for _ in range(20):
                 if not os.path.exists("/tmp/android-clicker.sock"):

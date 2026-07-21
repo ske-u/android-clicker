@@ -21,7 +21,7 @@ _MOD_NAMES = {
     "meta": [ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA],
 }
 
-_INOTIFY_MASK = 0x100
+_INOTIFY_MASK = 0x104  # IN_CREATE | IN_ATTRIB
 _IN_NONBLOCK = 0o4000
 _IN_CLOEXEC = 0o2000000
 _INOTIFY_EVENT_SIZE = 16
@@ -204,6 +204,8 @@ class LinuxHotkeyImpl:
             offset += name_len
             if not name:
                 continue
+            if not (mask & _INOTIFY_MASK):
+                continue
 
             path = f"/dev/input/{name}"
             if path in self._device_paths:
@@ -213,7 +215,7 @@ class LinuxHotkeyImpl:
                 dev = InputDevice(path)
                 if ecodes.EV_KEY not in dev.capabilities():
                     dev.close()
-                    return
+                    continue
                 _os.set_blocking(dev.fd, False)
                 self._devices.append(dev)
                 self._device_paths.add(path)

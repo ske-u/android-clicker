@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import signal
 import socket
@@ -19,15 +20,14 @@ except ImportError:
 from .config import (
     parse_value,
 )
-from .daemon import SOCKET_PATH as DAEMON_SOCKET
+from .daemon import SOCKET_PATH as DAEMON_SOCKET, SOCKET_FAMILY, OVERLAY_SOCKET
 from .injectors import METHODS
-from .widget_utils import DARK_QSS, disable_right_click, send_cmd, singleton_lock
+from .widget_utils import DARK_QSS, DaemonClient, disable_right_click, send_cmd, singleton_lock
 
 
-OVERLAY_SOCKET = "/tmp/android-clicker-overlay.sock"
 
 RESIZE_MARGIN = 4
-MIN_WIDTH = 120
+MIN_WIDTH = 270
 MAX_WIDTH = 1000
 
 
@@ -36,7 +36,7 @@ MAX_WIDTH = 1000
 
 COMBO_KEYS = {
     "method": METHODS,
-    "action": ["click", "click_cursor", "wait", "screencap_check", "notify", "log", "run_mode", "run", "zoom"],
+    "action": ["area", "click", "click_cursor", "wait", "screencap_check", "notify", "log", "run_mode", "run", "zoom", "stop"],
     "cycle_mode": ["clicks", "delay"],
 }
 
@@ -65,7 +65,7 @@ TOOLTIPS = {
     "end": "Final spread as % of window (5-95)",
     "colour": "Hex colour to match (e.g. 32343B)",
     "tol": "Colour tolerance (0-255)",
-    "then": "Step index to jump to on match",
+    "then": "Step index to jump to after action (-1 = next)",
     "else": "Step index on no match (-1 = next)",
     "w": "Region width in Android pixels",
     "h": "Region height in Android pixels",
@@ -78,6 +78,9 @@ TOOLTIPS = {
     "jitter_timer": "Random offset on reset_timer (ms)",
     "reset_timer": "ms before cycling back to first point",
     "duration": "Duration of zoom gesture in ms",
+    "angle": "Rotation in degrees (0 = axis-aligned)",
+    "unique": "No duplicate coordinates within burst",
+    "min_dist": "Minimum px from previous click (0 = off)",
 }
 
 
@@ -165,17 +168,28 @@ def _add_label_help(label, key):
 
 
 DISPLAY_NAMES = {
+    "angle": "angle",
+    "area": "area",
     "click_cursor": "cursor click",
+    "unique": "unique",
+    "cycle_clicks": "cycle clicks",
+    "cycle_delay": "cycle delay",
+    "cycle_mode": "cycle mode",
     "jitter_clicks": "jitter clicks",
+    "jitter_timer": "jitter timer",
     "screencap_check": "colour check",
     "run_mode": "run mode",
+    "min_dist": "min dist",
     "screen_cap": "colour",
     "jitter_ms": "jitter ms",
     "jitter_px": "jitter px",
     "default_wait_ms": "wait",
+    "else": "else jump to",
     "wait_jitter": "wait jitter",
+    "reset_timer": "reset timer",
     "duration_ms": "duration ms",
     "timeout_ms": "timeout ms",
+    "then": "jump to",
 }
 
 
@@ -203,6 +217,7 @@ def _widget_for(key, val):
         if idx >= 0:
             w.setCurrentIndex(idx)
         disable_right_click(w)
+        w.setMaxVisibleItems(15)
         return w
     if isinstance(val, float):
         w = QDoubleSpinBox()
@@ -240,30 +255,41 @@ def _widget_value(w, key=None):
     return parse_value(w.text())
 
 
+def _fmt_cycle(cyc_ms):
+    s = round(cyc_ms / 1000)
+    if s < 60:
+        return f"~{s}s per cycle"
+    return f"~{s // 60}m {s % 60:02d}s per cycle"
+
+
 ACTION_FIELDS = {
-    "click":           ["action", "x", "y", "clicks", "interval", "jitter_ms", "jitter_px"],
-    "click_cursor":    ["action", "clicks", "interval", "jitter_ms", "jitter_px"],
-    "wait":            ["action", "ms", "wait_jitter"],
+    "area":            ["action", "x", "y", "w", "h", "angle", "clicks", "interval", "jitter_ms", "jitter_px", "min_dist", "unique", "then"],
+    "click":           ["action", "x", "y", "clicks", "interval", "jitter_ms", "jitter_px", "then"],
+    "click_cursor":    ["action", "clicks", "interval", "jitter_ms", "jitter_px", "then"],
+    "wait":            ["action", "ms", "wait_jitter", "then"],
     "screencap_check": ["action", "x", "y", "w", "h", "colour", "tol", "then", "checks", "else"],
 
 
-    "notify":          ["action", "message"],
-    "log":             ["action", "message"],
-    "run_mode":        ["action", "mode", "duration_ms"],
-    "run":             ["action", "cmd", "timeout_ms"],
-    "zoom":            ["action", "x", "y", "start", "end", "duration"],
+    "notify":          ["action", "message", "then"],
+    "log":             ["action", "message", "then"],
+    "stop":            ["action"],
+    "run_mode":        ["action", "mode", "duration_ms", "then"],
+    "run":             ["action", "cmd", "timeout_ms", "then"],
+    "zoom":            ["action", "x", "y", "start", "end", "duration", "then"],
 }
 
 ACTION_DEFAULTS = {
-    "click":           {"x": 0, "y": 0, "clicks": 1, "interval": 200, "jitter_ms": 5, "jitter_px": 5},
-    "click_cursor":    {"clicks": 1, "interval": 200, "jitter_ms": 5, "jitter_px": 5},
-    "wait":            {"ms": 1000, "wait_jitter": 0},
-    "screencap_check": {"x": 0, "y": 0, "w": 20, "h": 20, "colour": "000000", "tol": 1, "then": 0, "checks": [], "else": -1},
-    "notify":          {"message": ""},
-    "log":             {"message": ""},
-    "run_mode":        {"mode": "", "duration_ms": 30000},
-    "run":             {"cmd": "", "timeout_ms": 5000},
-    "zoom":            {"x": 500, "y": 500, "start": 10, "end": 90, "duration": 300},
+    "area":            {"x": 500, "y": 500, "w": 200, "h": 200, "angle": 0, "clicks": 5, "interval": 200, "jitter_ms": 5, "jitter_px": 5, "min_dist": 0, "unique": False, "then": -1},
+    "click":           {"x": 500, "y": 500, "clicks": 1, "interval": 200, "jitter_ms": 5, "jitter_px": 5, "then": -1},
+    "click_cursor":    {"clicks": 1, "interval": 200, "jitter_ms": 5, "jitter_px": 5, "then": -1},
+    "wait":            {"ms": 1000, "wait_jitter": 0, "then": -1},
+    "screencap_check": {"x": 500, "y": 500, "w": 20, "h": 20, "colour": "000000", "tol": 1, "then": -1, "checks": [], "else": -1},
+    "notify":          {"message": "", "then": -1},
+    "log":             {"message": "", "then": -1},
+    "stop":            {},
+    "run_mode":        {"mode": "", "duration_ms": 30000, "then": -1},
+    "run":             {"cmd": "", "timeout_ms": 5000, "then": -1},
+    "zoom":            {"x": 500, "y": 500, "start": 10, "end": 90, "duration": 300, "then": -1},
 }
 
 
@@ -503,6 +529,9 @@ class _ArrayItem(QWidget):
             for k in ("x", "y", "ms", "message", "mode"):
                 if k in item and item[k] is not None:
                     parts.append(f"<b>{item[k]}</b>")
+            then_val = item.get("then")
+            if isinstance(then_val, int) and then_val >= 0:
+                parts.append(f"→<b>{then_val}</b>")
             return " ".join(parts)
         s = f"(<b>{item.get('x', '?')}</b>, <b>{item.get('y', '?')}</b>)"
         if "clicks" in item:
@@ -637,7 +666,9 @@ class _ArrayItem(QWidget):
             kl = _make_key_label(k, 85)
             row2.addWidget(kl)
             if k == "clicks" and k not in self._item:
-                w = QLineEdit()
+                w = QSpinBox()
+                w.setRange(0, 999999)
+                w.setValue(0)
                 disable_right_click(w)
             elif action == "run_mode" and k == "mode":
                 w = QComboBox()
@@ -669,7 +700,9 @@ class _ArrayItem(QWidget):
             self._field_edits[k] = w
             self._detail_layout.addLayout(row2)
 
-        for w in self._field_edits.values():
+        for k, w in self._field_edits.items():
+            if k == "action":
+                continue
             w.setEnabled(not self._disabled)
 
         if action == "run_mode" and self._item.get("mode"):
@@ -713,18 +746,28 @@ class _ArrayItem(QWidget):
         self._detail.setVisible(self._expanded)
 
     def _on_field_edit(self, key, widget):
-        if key == "clicks" and isinstance(widget, QLineEdit) and not widget.text():
-            self._item.pop("clicks", None)
+        if key == "clicks":
+            val = _widget_value(widget, key)
+            if val == 0:
+                self._item.pop("clicks", None)
+            else:
+                self._item[key] = val
         else:
             self._item[key] = _widget_value(widget, key)
         self._summary.setText(self._summary_text())
         self._parent_widget._mark_dirty()
         self._parent_widget._push_dots()
+        if self._array_key == "points":
+            self._parent_widget._update_points_header()
         if key == "action":
             self._rebuild_detail()
+            self._summary.setText(self._summary_text())
+            self._parent_widget._update_referenced()
             self._disabled = self._item.get("action") in self._parent_widget._disabled_actions
             self._refresh_style()
-            for w in self._field_edits.values():
+            for k, w in self._field_edits.items():
+                if k == "action":
+                    continue
                 w.setEnabled(not self._disabled)
         elif key == "mode" and self._item.get("action") == "run_mode":
             standard = set(ACTION_FIELDS["run_mode"])
@@ -732,12 +775,15 @@ class _ArrayItem(QWidget):
                 if k not in standard:
                     del self._item[k]
             self._rebuild_detail()
+            self._summary.setText(self._summary_text())
         elif key in ("then", "colour", "else") and self._item.get("action") == "screencap_check":
+            self._parent_widget._update_referenced()
+        elif key == "then":
             self._parent_widget._update_referenced()
 
     def _handle_capture(self, cx, cy):
         action = self._item.get("action")
-        if action in ("click", "zoom"):
+        if action in ("click", "zoom", "area"):
             self._item["x"] = cx
             self._item["y"] = cy
             self._sync_field("x", cx)
@@ -745,31 +791,12 @@ class _ArrayItem(QWidget):
             self._summary.setText(self._summary_text())
             self._parent_widget._exit_capture()
         elif action == "screencap_check":
-            if self._capture_p1 is None:
-                self._capture_p1 = (cx, cy)
-                self._item["x"] = cx
-                self._item["y"] = cy
-                self._sync_field("x", cx)
-                self._sync_field("y", cy)
-                self._summary.setText(self._summary_text())
-            else:
-                x1, y1 = self._capture_p1
-                x2, y2 = cx, cy
-                nx = min(x1, x2)
-                ny = min(y1, y2)
-                nw = abs(x2 - x1)
-                nh = abs(y2 - y1)
-                self._item["x"] = nx
-                self._item["y"] = ny
-                self._item["w"] = nw
-                self._item["h"] = nh
-                self._sync_field("x", nx)
-                self._sync_field("y", ny)
-                self._sync_field("w", nw)
-                self._sync_field("h", nh)
-                self._summary.setText(self._summary_text())
-                self._capture_p1 = None
-                self._parent_widget._exit_capture()
+            self._item["x"] = cx
+            self._item["y"] = cy
+            self._sync_field("x", cx)
+            self._sync_field("y", cy)
+            self._summary.setText(self._summary_text())
+            self._parent_widget._exit_capture()
 
     def _sync_field(self, key, value):
         w = self._field_edits.get(key)
@@ -831,8 +858,10 @@ class SidebarPanel(QFrame):
         self._uinput_available = False
         self._dirty = False
         self._select_shows_sidebar = True
+        self._dc = DaemonClient(timeout=0.5)
+        self._points_header = None
 
-        self.setGeometry(0, 0, 250, parent_overlay.height())
+        self.setGeometry(0, 0, MIN_WIDTH, parent_overlay.height())
         self.setMouseTracking(True)
         self.setStyleSheet("SidebarPanel { background: #2a2a2a; }")
 
@@ -1031,61 +1060,53 @@ class SidebarPanel(QFrame):
     # --- Cursor polling ---
 
     def _poll_cursor(self):
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
-            sock.connect(DAEMON_SOCKET)
-            sock.send(json.dumps({"cmd": "cursor_pos"}).encode())
-            data = json.loads(sock.recv(65536).decode())
-            sock.close()
-            if data.get("ok"):
-                d = data["data"]
-                self._last_cursor = d
-                self._uinput_available = d.get("uinput_available", False)
-                ar = d.get("android_resolution")
-                if ar:
-                    self._android_w = ar["w"]
-                    self._android_h = ar["h"]
-                h = d["host"]
-                self._parent_overlay._overlay_host_lbl.setText(f"Host: {h['x']}, {h['y']}")
-                a = d.get("android")
-                self._parent_overlay._overlay_android_lbl.setText(
-                    f"Android: {a['x']}, {a['y']}" if a else "Android: \u2014, \u2014"
-                )
-                if self._mode_combo.count() == 0 and "modes" in d:
-                    self._populate_modes(d["modes"], select_mode=d.get("mode"))
+        data = self._dc.send("cursor_pos")
+        if data and data.get("ok"):
+            d = data["data"]
+            self._last_cursor = d
+            self._uinput_available = d.get("uinput_available", False)
+            ar = d.get("android_resolution")
+            if ar:
+                self._android_w = ar["w"]
+                self._android_h = ar["h"]
+            h = d["host"]
+            self._parent_overlay._overlay_host_lbl.setText(f"Host: {h['x']}, {h['y']}")
+            a = d.get("android")
+            self._parent_overlay._overlay_android_lbl.setText(
+                f"Android: {a['x']}, {a['y']}" if a else "Android: \u2014, \u2014"
+            )
+            if self._mode_combo.count() == 0 and "modes" in d:
+                self._populate_modes(d["modes"], select_mode=d.get("mode"))
 
-                # If current sidebar mode was deleted, switch to a valid mode
-                if "modes" in d and self._mode_name and self._mode_name not in d["modes"]:
-                    daemon_mode = d.get("mode", "")
-                    target = (daemon_mode if daemon_mode in d["modes"]
-                              else next((m for m in d["modes"] if ".template" not in m), ""))
-                    if target:
-                        self._mode_combo.blockSignals(True)
-                        self._mode_combo.clear()
-                        for mname in d["modes"]:
-                            if ".template" not in mname:
-                                self._mode_combo.addItem(mname)
-                        self._mode_combo.setCurrentText(target)
-                        self._mode_combo.blockSignals(False)
-                        self._mode_name = target
-                        resp = send_cmd("read_mode", mode=target)
-                        self._rebuild_config(resp.get("data", {}) if resp else {})
+            # If current sidebar mode was deleted, switch to a valid mode
+            if "modes" in d and self._mode_name and self._mode_name not in d["modes"]:
+                daemon_mode = d.get("mode", "")
+                target = (daemon_mode if daemon_mode in d["modes"]
+                          else next((m for m in d["modes"] if ".template" not in m), ""))
+                if target:
+                    self._mode_combo.blockSignals(True)
+                    self._mode_combo.clear()
+                    for mname in d["modes"]:
+                        if ".template" not in mname:
+                            self._mode_combo.addItem(mname)
+                    self._mode_combo.setCurrentText(target)
+                    self._mode_combo.blockSignals(False)
+                    self._mode_name = target
+                    resp = send_cmd("read_mode", mode=target)
+                    self._rebuild_config(resp.get("data", {}) if resp else {})
 
-                # Overlay state from daemon
-                os_ = d.get("overlay_state", {})
-                ow = self._parent_overlay
-                new_visible = os_.get("visible", ow._overlay_visible)
-                if new_visible != ow._overlay_visible:
-                    ow._overlay_visible = new_visible
-                    ow.setVisible(new_visible)
-                if os_.get("quit"):
-                    if self._confirm_discard():
-                        QApplication.quit()
-                    return
-            else:
-                self._clear_status()
-        except Exception:
+            # Overlay state from daemon
+            os_ = d.get("overlay_state", {})
+            ow = self._parent_overlay
+            new_visible = os_.get("visible", ow._overlay_visible)
+            if new_visible != ow._overlay_visible:
+                ow._overlay_visible = new_visible
+                ow.setVisible(new_visible)
+            if os_.get("quit"):
+                if self._confirm_discard():
+                    QApplication.quit()
+                return
+        else:
             self._clear_status()
 
     def _clear_status(self):
@@ -1124,7 +1145,7 @@ class SidebarPanel(QFrame):
 
     def _resize_to_target(self):
         try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock = socket.socket(SOCKET_FAMILY, socket.SOCK_STREAM)
             sock.settimeout(0.5)
             sock.connect(DAEMON_SOCKET)
             sock.send(json.dumps({"cmd": "cursor_pos"}).encode())
@@ -1267,11 +1288,17 @@ class SidebarPanel(QFrame):
             self._disabled_actions.add("zoom")
             self._data["method"] = "adb-pipe"
 
+        self._points_header = None
         self._clear_layout(self._scroll_layout)
 
         has_config = bool(data)
 
-        for key, val in data.items():
+        keys = list(data.keys())
+        if "repeat" in keys and "method" in keys:
+            keys.remove("repeat")
+            keys.insert(keys.index("method") + 1, "repeat")
+        for key in keys:
+            val = data[key]
             if key in ("points", "sequence", "zoom"):
                 continue
             if isinstance(val, list) or isinstance(val, dict):
@@ -1306,6 +1333,11 @@ class SidebarPanel(QFrame):
             self._scalar_edits[key] = w
             self._scroll_layout.addLayout(row)
 
+        cm = self._scalar_edits.get("cycle_mode")
+        if cm:
+            cm.currentTextChanged.connect(self._on_cycle_mode_changed)
+            self._on_cycle_mode_changed()
+
         if any(k in data for k in ("points", "sequence")):
             sep = QFrame()
             sep.setFixedHeight(1)
@@ -1322,13 +1354,53 @@ class SidebarPanel(QFrame):
         self._add_btn.setEnabled("points" in data or "sequence" in data)
         self._push_dots()
         self._update_cursor_btn()
+        self._update_referenced()
 
     def _on_scalar_edit(self, key, widget):
         self._data[key] = _widget_value(widget, key)
         self._mark_dirty()
         self._push_dots()
+        self._update_points_header()
         if key == "screen_cap":
             self._update_disabled_actions()
+
+    def _on_cycle_mode_changed(self):
+        cm = self._scalar_edits.get("cycle_mode")
+        if not cm:
+            return
+        is_clicks = cm.currentData() == "clicks"
+        for key in ("cycle_clicks", "jitter_clicks"):
+            w = self._scalar_edits.get(key)
+            if w:
+                w.setEnabled(is_clicks)
+        w = self._scalar_edits.get("cycle_delay")
+        if w:
+            w.setEnabled(not is_clicks)
+        self._update_points_header()
+
+    def _update_points_header(self):
+        if not self._points_header:
+            return
+        data = getattr(self, "_data", {})
+        points = data.get("points", [])
+        base = f"points ({len(points)} item{'s' if len(points) != 1 else ''})"
+        if not points:
+            self._points_header.setText(base)
+            return
+
+        cycle_mode = data.get("cycle_mode", "clicks")
+        interval = data.get("interval", 50)
+        jit_clicks = data.get("jitter_clicks", 0)
+        cycle_clicks = data.get("cycle_clicks", 20)
+        cycle_delay = data.get("cycle_delay", 1000)
+
+        if cycle_mode == "clicks":
+            cyc_ms = sum(p.get("clicks") or cycle_clicks for p in points) * interval
+        else:
+            cyc_ms = len(points) * cycle_delay
+
+        suffix = _fmt_cycle(cyc_ms)
+        self._points_header.setText(f"{base} \u2014 {suffix}")
 
     def _select_from_dots_idx(self, dots_idx):
         data = getattr(self, "_data", {})
@@ -1339,7 +1411,7 @@ class SidebarPanel(QFrame):
             vis_idx = dots_idx - len(points)
             count = 0
             for i, s in enumerate(data.get("sequence", [])):
-                if s.get("action") in ("click", "zoom", "screencap_check"):
+                if s.get("action") in ("click", "zoom", "screencap_check", "area"):
                     if count == vis_idx:
                         self._select_array_item("sequence", i, allow_deselect=False)
                         if self._select_shows_sidebar and not self.isVisible():
@@ -1416,6 +1488,7 @@ class SidebarPanel(QFrame):
             self._ensure_visible(array_key, index)
         self._push_dots()
         self._update_cursor_btn()
+        self._update_referenced()
 
     def _deselect_all(self):
         if self._selected_array and self._selected_idx >= 0:
@@ -1461,7 +1534,7 @@ class SidebarPanel(QFrame):
         if self._selected_array == "sequence":
             arr = (self._data or {}).get("sequence", [])
             if 0 <= self._selected_idx < len(arr):
-                return arr[self._selected_idx].get("action") in ("click", "zoom", "screencap_check")
+                return arr[self._selected_idx].get("action") in ("click", "zoom", "screencap_check", "area")
         return False
 
     # --- Referenced item highlighting ---
@@ -1481,12 +1554,13 @@ class SidebarPanel(QFrame):
             ct = check.get("then")
             if isinstance(ct, int) and ct >= 0:
                 entries.append((ct, check.get("colour") or "default"))
-        else_idx = item.get("else", -1)
-        if isinstance(else_idx, int):
-            if else_idx >= 0:
-                entries.append((else_idx, "default"))
-            elif else_idx == -1:
-                entries.append((self._selected_idx + 1, "default"))
+        if item.get("action") == "screencap_check":
+            else_idx = item.get("else", -1)
+            if isinstance(else_idx, int):
+                if else_idx >= 0:
+                    entries.append((else_idx, "default"))
+                elif else_idx == -1:
+                    entries.append((self._selected_idx + 1, "default"))
         info = self._array_widgets.get("sequence")
         if info:
             for idx, colour in entries:
@@ -1499,8 +1573,7 @@ class SidebarPanel(QFrame):
             arr = (self._data or {}).get("sequence", [])
             if 0 <= self._selected_idx < len(arr):
                 item = arr[self._selected_idx]
-                if item.get("action") == "screencap_check":
-                    self._set_referenced_from_item(item)
+                self._set_referenced_from_item(item)
 
     # ---
 
@@ -1524,8 +1597,11 @@ class SidebarPanel(QFrame):
             elif a == "zoom":
                 dots.append({"type": "zoom", "ax": s.get("x", 0), "ay": s.get("y", 0)})
             elif a == "screencap_check":
-                dots.append({"type": "rect", "ax": s.get("x", 0), "ay": s.get("y", 0),
-                             "aw": s.get("w", 20), "ah": s.get("h", 20)})
+                dots.append({"type": "area", "ax": s.get("x", 0), "ay": s.get("y", 0),
+                             "aw": s.get("w", 20), "ah": s.get("h", 20), "angle": 0, "color": "#ff6400", "rot": False})
+            elif a == "area":
+                dots.append({"type": "area", "ax": s.get("x", 0), "ay": s.get("y", 0),
+                             "aw": s.get("w", 200), "ah": s.get("h", 200), "angle": s.get("angle", 0), "color": "#00c8ff"})
         if self._selected_array == "points" and self._selected_idx >= 0:
             if self._selected_idx < len(data.get("points", [])):
                 selected_idx = self._selected_idx
@@ -1535,11 +1611,12 @@ class SidebarPanel(QFrame):
                 if i == self._selected_idx:
                     selected_idx = seq_dot_offset + count
                     break
-                if s.get("action") in ("click", "zoom", "screencap_check"):
+                if s.get("action") in ("click", "zoom", "screencap_check", "area"):
                     count += 1
         if self._android_w is not None:
             self._parent_overlay._android_w = self._android_w
             self._parent_overlay._android_h = self._android_h
+        self._parent_overlay.set_dots(dots, selected_idx)
         self._parent_overlay.set_dots(dots, selected_idx)
 
     # --- Array editor ---
@@ -1554,6 +1631,9 @@ class SidebarPanel(QFrame):
         f = header.font()
         f.setBold(True)
         header.setFont(f)
+        if array_key == "points":
+            self._points_header = header
+            self._update_points_header()
         container_layout.addWidget(header)
         container.installEventFilter(self)
 
@@ -1604,9 +1684,9 @@ class SidebarPanel(QFrame):
         self._select_array_item(key, best_idx)
 
     def _add_array_item(self, array_key, index=None):
-        default = {"x": 0, "y": 0}
+        default = {"x": 500, "y": 500}
         if array_key == "sequence":
-            default = {"action": "click", "x": 0, "y": 0}
+            default = {"action": "click", "x": 500, "y": 500}
         arr = self._data.setdefault(array_key, [])
         if index is not None:
             arr.insert(index, default)
@@ -1632,6 +1712,8 @@ class SidebarPanel(QFrame):
         header = container_layout.itemAt(0).widget()
         if isinstance(header, QLabel):
             header.setText(f"{array_key} ({len(info['widgets'])} items)")
+        if array_key == "points":
+            self._update_points_header()
         self._save_btn.setEnabled(True)
         self._push_dots()
         self._select_array_item(array_key, idx)
@@ -1689,6 +1771,8 @@ class SidebarPanel(QFrame):
         header = container_layout.itemAt(0).widget()
         if isinstance(header, QLabel):
             header.setText(f"{self._capture_array_key} ({len(info['widgets'])} items)")
+        if self._capture_array_key == "points":
+            self._update_points_header()
         self._save_btn.setEnabled(True)
         self._select_array_item(self._capture_array_key, idx)
 
@@ -1736,6 +1820,8 @@ class SidebarPanel(QFrame):
         header = container_layout.itemAt(0).widget()
         if isinstance(header, QLabel):
             header.setText(f"{array_key} ({len(info['widgets'])} items)")
+        if array_key == "points":
+            self._update_points_header()
         self._save_btn.setEnabled(True)
         self._push_dots()
 
@@ -1773,6 +1859,8 @@ class SidebarPanel(QFrame):
         header = container_layout.itemAt(0).widget()
         if isinstance(header, QLabel):
             header.setText(f"{array_key} ({len(info['widgets'])} items)")
+        if array_key == "points":
+            self._update_points_header()
         self._save_btn.setEnabled(True)
         self._push_dots()
 
@@ -1869,6 +1957,7 @@ class OverlayWindow(QWidget):
         self._drag_handle = None
         self._drag_start_rect = None
         self._drag_start_mouse = None
+        self._drag_start_angle = None
         self._win_bounds = None
         self._android_w = None
         self._android_h = None
@@ -1987,32 +2076,65 @@ class OverlayWindow(QWidget):
         p.drawLine(ox - 10, oy, ox + 10, oy)
         p.drawLine(ox, oy - 10, ox, oy + 10)
 
-    def _handle_positions(self, ox, oy, ow, oh):
-        return [("tl", ox, oy), ("br", ox + ow, oy + oh)]
+    def _area_handle_positions(self, ox, oy, ow, oh, angle_deg):
+        rad = math.radians(angle_deg)
+        cr, sr = math.cos(rad), math.sin(rad)
+        return [
+            ("tl", ox + int(-ow / 2 * cr + oh / 2 * sr),
+                   oy + int(-ow / 2 * sr - oh / 2 * cr)),
+            ("tr", ox + int(ow / 2 * cr + oh / 2 * sr),
+                   oy + int(ow / 2 * sr - oh / 2 * cr)),
+            ("br", ox + int(ow / 2 * cr - oh / 2 * sr),
+                   oy + int(ow / 2 * sr + oh / 2 * cr)),
+            ("bl", ox + int(-ow / 2 * cr - oh / 2 * sr),
+                   oy + int(-ow / 2 * sr + oh / 2 * cr)),
+            ("rot", ox + int(oh / 2 * sr),
+                    oy + int(-oh / 2 * cr)),
+            ("rot", ox + int(ow / 2 * cr),
+                    oy + int(ow / 2 * sr)),
+            ("rot", ox + int(-oh / 2 * sr),
+                    oy + int(oh / 2 * cr)),
+            ("rot", ox + int(-ow / 2 * cr),
+                    oy + int(-ow / 2 * sr)),
+        ]
 
-    def _draw_rect(self, p, ox, oy, ow, oh, highlight):
-        color = QColor("#ffb217") if highlight else QColor("#ff6400")
+    def _draw_area(self, p, ox, oy, ow, oh, angle_deg, highlight, base_color="#00c8ff", show_rot=True):
+        color = QColor("#ffb217") if highlight else QColor(base_color)
+        p.save()
+        p.translate(ox, oy)
+        p.rotate(angle_deg)
         p.setPen(QPen(color, 2))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRect(ox, oy, ow, oh)
+        p.drawRect(-ow // 2, -oh // 2, ow, oh)
+        p.restore()
         if highlight:
             p.setBrush(QColor("#ffb217"))
             p.setPen(Qt.PenStyle.NoPen)
-            for _, hx, hy in self._handle_positions(ox, oy, ow, oh):
-                p.drawRect(hx - 3, hy - 3, 6, 6)
+            for name, hx, hy in self._area_handle_positions(ox, oy, ow, oh, angle_deg):
+                if name == "rot" and not show_rot:
+                    continue
+                if name == "rot":
+                    p.drawEllipse(hx - 4, hy - 4, 8, 8)
+                else:
+                    p.drawRect(hx - 3, hy - 3, 6, 6)
 
     def _hit_test_rect_handle(self, pos, idx, d):
-        ox, oy = self._to_overlay(d.get("ax", 0), d.get("ay", 0))
-        aw, ah = d.get("aw", 20), d.get("ah", 20)
-        if self._win_bounds and self._android_w is not None and self._android_w > 0:
-            _, _, ww, wh = self._win_bounds
-            ow = int(aw / self._android_w * ww)
-            oh = int(ah / self._android_h * wh)
-        else:
-            ow, oh = aw, ah
-        for name, hx, hy in self._handle_positions(ox, oy, ow, oh):
-            if abs(pos.x() - hx) <= 10 and abs(pos.y() - hy) <= 10:
-                return name
+        t = d.get("type")
+        if t == "area":
+            ox, oy = self._to_overlay(d.get("ax", 0), d.get("ay", 0))
+            aw, ah = d.get("aw", 200), d.get("ah", 200)
+            if self._win_bounds and self._android_w is not None and self._android_w > 0:
+                _, _, ww, wh = self._win_bounds
+                ow = int(aw / self._android_w * ww)
+                oh = int(ah / self._android_h * wh)
+            else:
+                ow, oh = aw, ah
+            for name, hx, hy in self._area_handle_positions(ox, oy, ow, oh, d.get("angle", 0)):
+                if name == "rot" and not d.get("rot", True):
+                    continue
+                if abs(pos.x() - hx) <= 10 and abs(pos.y() - hy) <= 10:
+                    return name
+            return None
         return None
 
     def _hit_test_dots(self, pos):
@@ -2024,15 +2146,15 @@ class OverlayWindow(QWidget):
             dx = pos.x() - ox
             dy = pos.y() - oy
             t = d.get("type")
-            if t == "rect":
-                aw, ah = d.get("aw", 20), d.get("ah", 20)
-                if self._win_bounds and self._android_w is not None and self._android_w > 0:
-                    _, _, ww, wh = self._win_bounds
-                    ow = int(aw / self._android_w * ww)
-                    oh = int(ah / self._android_h * wh)
-                else:
-                    ow, oh = aw, ah
-                if -5 <= dx <= ow + 5 and -5 <= dy <= oh + 5:
+            if t == "area":
+                aw, ah = d.get("aw", 200), d.get("ah", 200)
+                angle = d.get("angle", 0)
+                rad = math.radians(angle)
+                cac = self._to_android(int(ox), int(oy))
+                click_ax, click_ay = self._to_android(pos.x(), pos.y())
+                ldx = (click_ax - cac[0]) * math.cos(-rad) - (click_ay - cac[1]) * math.sin(-rad)
+                ldy = (click_ax - cac[0]) * math.sin(-rad) + (click_ay - cac[1]) * math.cos(-rad)
+                if -aw/2 - 5 <= ldx <= aw/2 + 5 and -ah/2 - 5 <= ldy <= ah/2 + 5:
                     return idx
             else:
                 d2 = dx*dx + dy*dy
@@ -2066,16 +2188,16 @@ class OverlayWindow(QWidget):
                 self._draw_dot(p, ox, oy, highlight)
             elif t == "zoom":
                 self._draw_zoom(p, ox, oy, highlight)
-            elif t == "rect":
-                aw = d.get("aw", 20)
-                ah = d.get("ah", 20)
+            elif t == "area":
+                aw = d.get("aw", 200)
+                ah = d.get("ah", 200)
                 if self._win_bounds and self._android_w is not None and self._android_w > 0:
                     _, _, ww, wh = self._win_bounds
                     ow = int(aw / self._android_w * ww)
                     oh = int(ah / self._android_h * wh)
                 else:
                     ow, oh = aw, ah
-                self._draw_rect(p, ox, oy, ow, oh, highlight)
+                self._draw_area(p, ox, oy, ow, oh, d.get("angle", 0), highlight, d.get("color", "#00c8ff"), d.get("rot", True))
 
     def closeEvent(self, event):
         if self._sidebar._confirm_discard():
@@ -2091,7 +2213,9 @@ class OverlayWindow(QWidget):
             super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        btn = event.button()
+
+        if btn == Qt.MouseButton.LeftButton:
             if self._sidebar._capturing:
                 if not self._capture_btn.geometry().contains(event.pos()):
                     self._sidebar._add_captured_point()
@@ -2103,22 +2227,39 @@ class OverlayWindow(QWidget):
                     self._sidebar._select_from_dots_idx(idx)
                     d = self._dots_data[idx]
                     t = d.get("type")
-                    if t in ("dot", "zoom", "rect"):
+                    if t in ("dot", "zoom", "area"):
                         self._drag_idx = idx
-                        self._drag_ref = (self._sidebar._selected_array, self._sidebar._selected_idx)
-                        if t == "rect":
-                            handle = self._hit_test_rect_handle(event.pos(), idx, d)
-                            if handle:
-                                self._drag_handle = handle
-                                self._drag_start_rect = (d["ax"], d["ay"], d["aw"], d["ah"])
-                                self._drag_start_mouse = self._to_android(event.pos().x(), event.pos().y())
-                        if not self._drag_handle:
-                            self._drag_handle = ""
-                            ox, oy = self._to_overlay(d["ax"], d["ay"])
-                            self._drag_off_x = event.pos().x() - ox
-                            self._drag_off_y = event.pos().y() - oy
+                        self._drag_ref = (self._sidebar._selected_array,
+                                          self._sidebar._selected_idx)
+                        self._drag_handle = ""
+                        ox, oy = self._to_overlay(d["ax"], d["ay"])
+                        self._drag_off_x = event.pos().x() - ox
+                        self._drag_off_y = event.pos().y() - oy
                     event.accept()
                     return
+
+        elif btn == Qt.MouseButton.RightButton:
+            search = ([self._selected_dot_idx]
+                      if self._selected_dot_idx >= 0
+                      else []) + list(range(len(self._dots_data) - 1, -1, -1))
+            for idx in search:
+                d = self._dots_data[idx]
+                if d.get("type") == "area":
+                    handle = self._hit_test_rect_handle(event.pos(), idx, d)
+                    if handle:
+                        self._sidebar._select_from_dots_idx(idx)
+                        self._drag_idx = idx
+                        self._drag_ref = (self._sidebar._selected_array,
+                                           self._sidebar._selected_idx)
+                        self._drag_handle = handle
+                        self._drag_start_rect = (d["ax"], d["ay"],
+                                                  d["aw"], d["ah"])
+                        self._drag_start_mouse = self._to_android(
+                            event.pos().x(), event.pos().y())
+                        self._drag_start_angle = d.get("angle", 0)
+                        event.accept()
+                        return
+
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -2127,7 +2268,8 @@ class OverlayWindow(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if self._drag_idx >= 0 and event.button() == Qt.MouseButton.LeftButton:
+        if self._drag_idx >= 0 and event.button() in (
+                Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             self._update_drag(event.pos())
             self._sidebar._mark_dirty()
             self._sidebar._push_dots()
@@ -2136,41 +2278,68 @@ class OverlayWindow(QWidget):
             self._drag_handle = None
             self._drag_start_rect = None
             self._drag_start_mouse = None
+            self._drag_start_angle = None
         super().mouseReleaseEvent(event)
 
     def _update_drag(self, pos):
         d = self._dots_data[self._drag_idx]
         if self._drag_handle:
-            sax, say, saw, sah = self._drag_start_rect
-            smx, smy = self._drag_start_mouse
-            cmx, cmy = self._to_android(pos.x(), pos.y())
-            dx = cmx - smx
-            dy = cmy - smy
-            if self._drag_handle == "tl":
-                nx = sax + dx
-                ny = say + dy
-                nw = saw - dx
-                nh = sah - dy
-                if nw < 10:
-                    nw = 10
-                    nx = sax + saw - 10
-                if nh < 10:
-                    nh = 10
-                    ny = say + sah - 10
+            if d.get("type") == "area":
+                sax, say = d["ax"], d["ay"]
+                angle = d.get("angle", 0)
+                rad = math.radians(angle)
+                cmx, cmy = self._to_android(pos.x(), pos.y())
+                if self._drag_handle == "rot":
+                    smx, smy = self._drag_start_mouse
+                    scx, scy = d["ax"], d["ay"]
+                    start_angle = math.degrees(math.atan2(smy - scy, smx - scx))
+                    cur_angle = math.degrees(math.atan2(cmy - scy, cmx - scx))
+                    delta = cur_angle - start_angle
+                    delta = (delta + 180) % 360 - 180
+                    new_angle = round(self._drag_start_angle + delta)
+                    d["angle"] = new_angle
+                    updates = {"angle": new_angle}
+                else:
+                    scx, scy, sw, sh = self._drag_start_rect
+                    cr = math.cos(rad)
+                    sr = math.sin(rad)
+                    ldx = (cmx - scx) * cr + (cmy - scy) * sr
+                    ldy = -(cmx - scx) * sr + (cmy - scy) * cr
+                    nw = max(10, int(abs(ldx) * 2))
+                    nh = max(10, int(abs(ldy) * 2))
+                    d["aw"], d["ah"] = nw, nh
+                    updates = {"w": nw, "h": nh}
             else:
-                nx = sax
-                ny = say
-                nw = saw + dx
-                nh = sah + dy
-                if nw < 10:
-                    nw = 10
-                if nh < 10:
-                    nh = 10
-            d["ax"] = nx
-            d["ay"] = ny
-            d["aw"] = nw
-            d["ah"] = nh
-            updates = {"x": nx, "y": ny, "w": nw, "h": nh}
+                sax, say, saw, sah = self._drag_start_rect
+                smx, smy = self._drag_start_mouse
+                cmx, cmy = self._to_android(pos.x(), pos.y())
+                dx = cmx - smx
+                dy = cmy - smy
+                if self._drag_handle == "tl":
+                    nx = sax + dx
+                    ny = say + dy
+                    nw = saw - dx
+                    nh = sah - dy
+                    if nw < 10:
+                        nw = 10
+                        nx = sax + saw - 10
+                    if nh < 10:
+                        nh = 10
+                        ny = say + sah - 10
+                else:
+                    nx = sax
+                    ny = say
+                    nw = saw + dx
+                    nh = sah + dy
+                    if nw < 10:
+                        nw = 10
+                    if nh < 10:
+                        nh = 10
+                d["ax"] = nx
+                d["ay"] = ny
+                d["aw"] = nw
+                d["ah"] = nh
+                updates = {"x": nx, "y": ny, "w": nw, "h": nh}
         else:
             new_ox = pos.x() - self._drag_off_x
             new_oy = pos.y() - self._drag_off_y

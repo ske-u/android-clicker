@@ -14,7 +14,20 @@ class MacAdapter(PlatformAdapter):
     def __init__(self, config=None):
         self._target = "BlueStacks"
         if config:
-            self._target = config.get("display", {}).get("target_process", "BlueStacks")
+            self._target = config.get("display", {}).get("target_app", "BlueStacks")
+
+    def _find_process(self):
+        r = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to get name of every process'],
+            capture_output=True, text=True, timeout=2
+        )
+        if r.returncode != 0:
+            return None
+        for name in r.stdout.strip().split(", "):
+            if self._target.lower() in name.lower():
+                return name
+        return None
 
     def notify(self, message):
         subprocess.run(
@@ -24,17 +37,20 @@ class MacAdapter(PlatformAdapter):
         )
 
     def get_window_bounds(self):
+        proc_name = self._find_process()
+        if not proc_name:
+            return None
         try:
             pos = subprocess.run(
                 ["osascript", "-e",
                  f'tell application "System Events" to get position '
-                 f'of window 1 of process "{self._target}"'],
+                 f'of window 1 of process "{proc_name}"'],
                 capture_output=True, text=True, timeout=2
             )
             size = subprocess.run(
                 ["osascript", "-e",
                  f'tell application "System Events" to get size '
-                 f'of window 1 of process "{self._target}"'],
+                 f'of window 1 of process "{proc_name}"'],
                 capture_output=True, text=True, timeout=2
             )
             if pos.returncode == 0 and size.returncode == 0:

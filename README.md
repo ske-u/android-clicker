@@ -1,8 +1,8 @@
 # android-clicker
 
-Auto-clicker daemon for Android emulators — **Waydroid on Linux (Hyprland)** and **BlueStacks on macOS**.
+Auto-clicker daemon for Android emulators — **Waydroid on Linux (Hyprland)** and **BlueStacks on macOS and Windows**.
 
-Single-process Unix-socket server with a CLI frontend. Optional PyQt6 overlay and launcher GUIs.
+Single-process socket server with a CLI frontend. Optional PyQt6 overlay and launcher GUIs.
 
 ## Platform support
 
@@ -10,6 +10,7 @@ Single-process Unix-socket server with a CLI frontend. Optional PyQt6 overlay an
 |----------|----------|--------|
 | Linux (Hyprland) | Waydroid | **Stable** |
 | macOS | BlueStacks | **Experimental** |
+| Windows | BlueStacks | **Experimental** |
 
 ## Quick start
 
@@ -22,10 +23,16 @@ python -m android_clicker start      # start the daemon
 python -m android_clicker launcher
 ```
 
+**Linux / macOS** — wrapper script (requires `chmod +x android-clicker` once):
 ```sh
-# Alternative — wrapper script (same effect, shorter)
 ./android-clicker start
 ./android-clicker launcher
+```
+
+**Windows** — invoke via Python directly (no shebang support):
+```sh
+python android-clicker start
+python android-clicker launcher
 ```
 
 ### macOS requirements
@@ -41,7 +48,8 @@ pip install PyQt6                # overlay + launcher GUI (all platforms)
 pip install tomlkit              # launcher config editor (all platforms)
 pip install Pillow               # screencap_check action (all platforms)
 pip install python-evdev         # uinput injector + global hotkeys (Linux)
-pip install pynput               # global hotkeys (macOS)
+pip install pynput               # global hotkeys (macOS, Windows)
+pip install win10toast           # desktop notifications (Windows)
 ```
 
 Uinput on Linux requires `input` group membership:
