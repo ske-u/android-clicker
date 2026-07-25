@@ -1,9 +1,11 @@
 import os
+import queue
 import re
 import socket
 import struct
-import sys
 import subprocess
+import sys
+import threading
 
 ADB_PATH = "adb"
 ADB_SERIAL = ""
@@ -37,13 +39,13 @@ def detect_adb_path():
                 return path
     return "adb"
 
-METHODS = ["adb-pipe", "uinput"]
+METHODS = ["adb-socket", "uinput"]
 
 
 def available_methods(uinput_enabled=False):
     if sys.platform == "linux" and uinput_enabled:
         return list(METHODS)
-    return ["adb-pipe"]
+    return ["adb-socket"]
 
 
 def create_shared_uinput(host_w, host_h):
@@ -127,7 +129,10 @@ class AdbSocketInjector(BaseInjector):
         self._closed = False
         self._shell_pid = None
         self.sock = None
+        self._queue = queue.Queue(maxsize=10000)
         self._connect()
+        self._worker = threading.Thread(target=self._writer, daemon=True)
+        self._worker.start()
 
     def _connect(self):
         try:
@@ -169,6 +174,17 @@ class AdbSocketInjector(BaseInjector):
         payload = cmd.encode() + b"\n"
         self.sock.sendall(f"{len(payload):04x}".encode() + payload)
 
+    def _writer(self):
+        while not self._dead:
+            try:
+                cmd = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self.sock.sendall(cmd)
+            except OSError:
+                break
+
     def healthy(self) -> bool:
         return not self._dead
 
@@ -176,9 +192,9 @@ class AdbSocketInjector(BaseInjector):
         if self._dead:
             return
         try:
-            self.sock.sendall(f"input tap {x} {y}\n".encode())
-        except OSError:
-            self._dead = True
+            self._queue.put_nowait(f"input tap {x} {y}\n".encode())
+        except queue.Full:
+            pass
 
     def _reconnect(self):
         self.close()
@@ -188,6 +204,7 @@ class AdbSocketInjector(BaseInjector):
     def drain(self):
         old_pid = self._shell_pid
         self._shell_pid = None
+        self._dead = True
         if self.sock is not None:
             try:
                 self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
@@ -195,13 +212,24 @@ class AdbSocketInjector(BaseInjector):
             except OSError:
                 pass
             self.sock = None
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
         if old_pid is not None:
-            try:
-                subprocess.run(_adb_cmd("shell", "kill", "-9", str(old_pid)),
-                               capture_output=True, timeout=2)
-            except Exception:
-                pass
+            threading.Thread(target=self._kill_pid, args=(old_pid,), daemon=True).start()
+        self._dead = False
         self._connect()
+        self._worker = threading.Thread(target=self._writer, daemon=True)
+        self._worker.start()
+
+    def _kill_pid(self, pid):
+        try:
+            subprocess.run(_adb_cmd("shell", "kill", "-9", str(pid)),
+                           capture_output=True, timeout=2)
+        except Exception:
+            pass
 
     def close(self):
         if self._closed:
@@ -260,6 +288,7 @@ class UinputInjector(BaseInjector):
 
 
 INJECTOR_CLASSES = {
+    "adb-socket": AdbSocketInjector,
     "adb-pipe": AdbSocketInjector,
     "uinput": UinputInjector,
 }
@@ -268,11 +297,11 @@ INJECTOR_CLASSES = {
 def create_injector(method, host_w, host_h, shared_uinput=None, adb_connect=None, adb_timeout=5):
     if method == "uinput":
         if sys.platform != "linux":
-            print("warning: uinput requires Linux, falling back to adb-pipe", file=sys.stderr)
-            method = "adb-pipe"
+            print("warning: uinput requires Linux, falling back to adb-socket", file=sys.stderr)
+            method = "adb-socket"
         elif shared_uinput is None:
-            print("warning: uinput disabled globally, falling back to adb-pipe", file=sys.stderr)
-            method = "adb-pipe"
+            print("warning: uinput disabled globally, falling back to adb-socket", file=sys.stderr)
+            method = "adb-socket"
     cls = INJECTOR_CLASSES.get(method)
     if cls is None:
         return None

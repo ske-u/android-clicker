@@ -90,7 +90,7 @@ Equivalent: `python -m android_clicker <command>`.
 <details>
 <summary>Backend & overlay</summary>
 
-- `./android-clicker method adb-pipe` — switch to ADB pipe injector
+- `./android-clicker method adb-socket` — switch to ADB socket injector
 - `./android-clicker method uinput` — switch to uinput injector (Linux only)
 - `./android-clicker overlay start` — open overlay GUI (blocks terminal)
 - `./android-clicker overlay toggle` — show/hide overlay

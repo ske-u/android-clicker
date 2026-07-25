@@ -129,6 +129,7 @@ class LauncherWindow(QWidget):
         mode_row.addWidget(QLabel("Mode:"))
         self._mode_combo = QComboBox()
         disable_right_click(self._mode_combo)
+        self._mode_combo.setMaxVisibleItems(20)
         self._mode_combo.currentTextChanged.connect(self._on_mode_changed)
         mode_row.addWidget(self._mode_combo, stretch=1)
         layout.addLayout(mode_row)
@@ -487,6 +488,7 @@ class ConfigEditorWindow(QWidget):
                         for item in wargs:
                             w.addItem(item)
                     disable_right_click(w)
+                    w.setMaxVisibleItems(20)
                 elif wtype == "combo_mode":
                     w = QComboBox()
                     for m in mode_names:
@@ -494,6 +496,7 @@ class ConfigEditorWindow(QWidget):
                     if "follow" not in mode_names:
                         w.addItem("follow")
                     disable_right_click(w)
+                    w.setMaxVisibleItems(20)
                 elif wtype == "spin":
                     lo, hi = wargs
                     w = QSpinBox()

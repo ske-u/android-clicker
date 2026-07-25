@@ -61,7 +61,7 @@ class ClickDaemon:
             try:
                 self._shared_uinput = create_shared_uinput(self.host_w, self.host_h)
             except Exception as e:
-                print(f"warning: uinput init failed ({e}); falling back to adb-pipe", file=sys.stderr)
+                print(f"warning: uinput init failed ({e}); falling back to adb-socket", file=sys.stderr)
 
         adb_cfg = config.get("adb", {})
         adb_connect = adb_cfg.get("connect")
@@ -86,7 +86,9 @@ class ClickDaemon:
         self._update_window()
 
         mode_cfg = load_modeconfig(self.mode)
-        method = mode_cfg.get("method", "adb-pipe")
+        method = mode_cfg.get("method", "adb-socket")
+        if method == "adb-pipe":
+            method = "adb-socket"
         result = create_injector(method, self.host_w, self.host_h,
                                  shared_uinput=self._shared_uinput,
                                  adb_connect=adb_connect,
@@ -234,7 +236,9 @@ class ClickDaemon:
         self._next_click = 0.0
 
         mode_cfg = load_modeconfig(name)
-        new_method = mode_cfg.get("method", "adb-pipe")
+        new_method = mode_cfg.get("method", "adb-socket")
+        if new_method == "adb-pipe":
+            new_method = "adb-socket"
 
         if new_method != old_method:
             result = create_injector(new_method, self.host_w, self.host_h,
@@ -454,11 +458,16 @@ class ClickDaemon:
 
         if cmd == "read_mode":
             data = load_modeconfig(args["mode"])
+            if data.get("method") == "adb-pipe":
+                data["method"] = "adb-socket"
             return {"ok": True, "data": data}
 
         if cmd == "save_mode":
             mode = args["mode"]
-            save_modeconfig(mode, args.get("data", {}))
+            data = args.get("data", {})
+            if data.get("method") == "adb-pipe":
+                data["method"] = "adb-socket"
+            save_modeconfig(mode, data)
             self.modes = create_modes(self.injector, self)
             if self.mode in self.modes:
                 self.current_mode = self.modes[self.mode]
@@ -503,6 +512,8 @@ class ClickDaemon:
                     return {"ok": False, "error": "method switch only allowed in follow mode"}
                 if name == "uinput" and self._shared_uinput is None:
                     return {"ok": False, "error": "uinput not available (set uinput=true in config)"}
+                if name == "adb-pipe":
+                    name = "adb-socket"
                 result = create_injector(name, self.host_w, self.host_h,
                                          shared_uinput=self._shared_uinput,
                                          adb_connect=self.adb_connect,

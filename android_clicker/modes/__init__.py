@@ -9,12 +9,12 @@ from ..config import MODECONFIG_DIR, load_modeconfig
 
 FOLLOW_TEMPLATE = """# follow mode
 #
-# method         Injection backend: "adb-pipe" or "uinput"
+# method         Injection backend: "adb-socket" or "uinput"
 # interval       ms between clicks
 # jitter_ms      ms random offset added to interval
 # jitter_px      px random offset on x/y per click
 
-method = "adb-pipe"
+method = "adb-socket"
 interval = 13
 jitter_ms = 3
 jitter_px = 10
@@ -31,7 +31,7 @@ BURST_TEMPLATE = """# follow.burst mode
 # jitter_ms      ms random offset added to interval
 # jitter_px      px random offset on x/y per click
 
-method = "adb-pipe"
+method = "adb-socket"
 clicks = 10
 jitter_clicks = 0
 interval = 13

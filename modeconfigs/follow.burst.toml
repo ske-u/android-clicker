@@ -9,7 +9,7 @@
 # jitter_ms      ms random offset added to interval
 # jitter_px      px random offset on x/y per click
 
-method = "adb-pipe"
+method = "adb-socket"
 clicks = 10
 jitter_clicks = 0
 interval = 13

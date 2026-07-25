@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import os
@@ -217,7 +218,7 @@ def _widget_for(key, val):
         if idx >= 0:
             w.setCurrentIndex(idx)
         disable_right_click(w)
-        w.setMaxVisibleItems(15)
+        w.setMaxVisibleItems(20)
         return w
     if isinstance(val, float):
         w = QDoubleSpinBox()
@@ -688,6 +689,7 @@ class _ArrayItem(QWidget):
                     w.setCurrentIndex(idx)
                 w.blockSignals(False)
                 disable_right_click(w)
+                w.setMaxVisibleItems(20)
             else:
                 w = _widget_for(k, v)
             if isinstance(w, QComboBox):
@@ -754,6 +756,10 @@ class _ArrayItem(QWidget):
                 self._item[key] = val
         else:
             self._item[key] = _widget_value(widget, key)
+        if key in ("x", "y", "w", "h"):
+            farr = self._parent_widget._float_data.get(self._array_key)
+            if farr and self._index < len(farr):
+                farr[self._index][key] = float(self._item[key])
         self._summary.setText(self._summary_text())
         self._parent_widget._mark_dirty()
         self._parent_widget._push_dots()
@@ -769,6 +775,8 @@ class _ArrayItem(QWidget):
                 if k == "action":
                     continue
                 w.setEnabled(not self._disabled)
+            self._parent_widget._fetch_ref_dots()
+            self._parent_widget._push_dots()
         elif key == "mode" and self._item.get("action") == "run_mode":
             standard = set(ACTION_FIELDS["run_mode"])
             for k in list(self._item):
@@ -776,6 +784,8 @@ class _ArrayItem(QWidget):
                     del self._item[k]
             self._rebuild_detail()
             self._summary.setText(self._summary_text())
+            self._parent_widget._fetch_ref_dots()
+            self._parent_widget._push_dots()
         elif key in ("then", "colour", "else") and self._item.get("action") == "screencap_check":
             self._parent_widget._update_referenced()
         elif key == "then":
@@ -788,6 +798,10 @@ class _ArrayItem(QWidget):
             self._item["y"] = cy
             self._sync_field("x", cx)
             self._sync_field("y", cy)
+            farr = self._parent_widget._float_data.get(self._array_key)
+            if farr and self._index < len(farr):
+                farr[self._index]["x"] = float(cx)
+                farr[self._index]["y"] = float(cy)
             self._summary.setText(self._summary_text())
             self._parent_widget._exit_capture()
         elif action == "screencap_check":
@@ -795,15 +809,23 @@ class _ArrayItem(QWidget):
             self._item["y"] = cy
             self._sync_field("x", cx)
             self._sync_field("y", cy)
+            farr = self._parent_widget._float_data.get(self._array_key)
+            if farr and self._index < len(farr):
+                farr[self._index]["x"] = float(cx)
+                farr[self._index]["y"] = float(cy)
             self._summary.setText(self._summary_text())
             self._parent_widget._exit_capture()
 
     def _sync_field(self, key, value):
         w = self._field_edits.get(key)
         if isinstance(w, QSpinBox):
+            w.blockSignals(True)
             w.setValue(value)
+            w.blockSignals(False)
         elif isinstance(w, QDoubleSpinBox):
+            w.blockSignals(True)
             w.setValue(value)
+            w.blockSignals(False)
         elif isinstance(w, QLineEdit):
             w.setText(str(value))
 
@@ -860,6 +882,13 @@ class SidebarPanel(QFrame):
         self._select_shows_sidebar = True
         self._dc = DaemonClient(timeout=0.5)
         self._points_header = None
+        self._original_data = {}
+        self._float_data = {}
+        self._cached_ref_dots = []
+        self._raw_ref_dots = []
+        self._snap_active = False
+        self._snap_rect = None
+        self._previous_scale = 100
 
         self.setGeometry(0, 0, MIN_WIDTH, parent_overlay.height())
         self.setMouseTracking(True)
@@ -877,6 +906,7 @@ class SidebarPanel(QFrame):
         edit_row.addWidget(edit_lbl)
         self._mode_combo = QComboBox()
         disable_right_click(self._mode_combo)
+        self._mode_combo.setMaxVisibleItems(20)
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         edit_row.addWidget(self._mode_combo, stretch=1)
 
@@ -912,6 +942,7 @@ class SidebarPanel(QFrame):
 
         self._create_type = QComboBox()
         disable_right_click(self._create_type)
+        self._create_type.setMaxVisibleItems(20)
         self._create_type.addItems(["custom", "fixed"])
         create_layout.addWidget(self._create_type)
 
@@ -981,10 +1012,94 @@ class SidebarPanel(QFrame):
         self._add_btn.clicked.connect(self._add_bottom)
         layout.addWidget(self._add_btn)
 
+        self._snap_btn = QPushButton("Snap")
+        self._snap_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #bbb; border: 1px solid #555;"
+            " border-radius: 3px; padding: 4px 8px; font-size: 12px; }"
+            "QPushButton:hover { background: #444; }"
+            "QPushButton:pressed { background: #555; }"
+        )
+        self._snap_btn.clicked.connect(self._toggle_snap)
+        layout.addWidget(self._snap_btn)
+
+        self._reset_btn = QPushButton("Reset")
+        self._reset_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #bbb; border: 1px solid #555;"
+            " border-radius: 3px; padding: 4px 8px; font-size: 12px; }"
+            "QPushButton:hover { background: #444; }"
+            "QPushButton:pressed { background: #555; }"
+        )
+        self._reset_btn.clicked.connect(self._on_reset)
+        layout.addWidget(self._reset_btn)
+
         self._save_btn = QPushButton("Save changes")
         self._save_btn.setEnabled(False)
         self._save_btn.clicked.connect(self._save)
         layout.addWidget(self._save_btn)
+
+        self._snap_row = QWidget()
+        self._snap_row.setVisible(False)
+        snap_row_layout = QHBoxLayout(self._snap_row)
+        snap_row_layout.setContentsMargins(0, 0, 0, 0)
+        snap_row_layout.setSpacing(4)
+        self._snap_range_spin = QSpinBox()
+        self._snap_range_spin.setRange(0, 200)
+        self._snap_range_spin.setValue(5)
+        self._snap_range_spin.setFixedWidth(50)
+        self._snap_range_spin.setToolTip("Range: max distance from reference coord")
+        snap_row_layout.addWidget(self._snap_range_spin)
+        self._snap_x_btn = QPushButton("X")
+        self._snap_x_btn.setFixedWidth(30)
+        self._snap_x_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #bbb; border: 1px solid #555;"
+            " border-radius: 3px; padding: 2px 4px; font-size: 11px; }"
+            "QPushButton:hover { background: #444; }"
+            "QPushButton:pressed { background: #555; }"
+        )
+        self._snap_x_btn.clicked.connect(self._on_snap_x)
+        snap_row_layout.addWidget(self._snap_x_btn)
+        self._snap_y_btn = QPushButton("Y")
+        self._snap_y_btn.setFixedWidth(30)
+        self._snap_y_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #bbb; border: 1px solid #555;"
+            " border-radius: 3px; padding: 2px 4px; font-size: 11px; }"
+            "QPushButton:hover { background: #444; }"
+            "QPushButton:pressed { background: #555; }"
+        )
+        self._snap_y_btn.clicked.connect(self._on_snap_y)
+        snap_row_layout.addWidget(self._snap_y_btn)
+        self._snap_q_btn = QPushButton("Q")
+        self._snap_q_btn.setFixedWidth(30)
+        self._snap_q_btn.setToolTip("Quit snap mode")
+        self._snap_q_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #bbb; border: 1px solid #555;"
+            " border-radius: 3px; padding: 2px 4px; font-size: 11px; }"
+            "QPushButton:hover { background: #444; }"
+            "QPushButton:pressed { background: #555; }"
+        )
+        self._snap_q_btn.clicked.connect(self._on_snap_quit)
+        snap_row_layout.addWidget(self._snap_q_btn)
+        snap_row_layout.addStretch()
+        layout.addWidget(self._snap_row)
+
+        # --- Scale ---
+        scale_row = QHBoxLayout()
+        scale_row.setSpacing(4)
+        scale_lbl = QLabel("Scale")
+        scale_lbl.setFixedWidth(40)
+        scale_row.addWidget(scale_lbl)
+        self._scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self._scale_slider.setRange(0, 500)
+        self._scale_slider.setValue(100)
+        self._scale_slider.setSingleStep(1)
+        self._scale_slider.setPageStep(1)
+        self._scale_slider.valueChanged.connect(self._on_scale_changed)
+        scale_row.addWidget(self._scale_slider, stretch=1)
+        self._scale_val = QLabel("100")
+        self._scale_val.setFixedWidth(28)
+        self._scale_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        scale_row.addWidget(self._scale_val)
+        layout.addLayout(scale_row)
 
         self._resize_btn = QPushButton("Resize")
         self._resize_btn.setToolTip("Resize/reposition overlay to target window")
@@ -1168,6 +1283,108 @@ class SidebarPanel(QFrame):
         except Exception:
             pass
 
+    # --- Scale ---
+
+    def _center(self):
+        if self._android_w is not None and self._android_h is not None:
+            return self._android_w // 2, self._android_h // 2
+        return None, None
+
+    def _build_float_from_data(self, data):
+        fdata = {}
+        for ak in ("points", "sequence"):
+            farr = []
+            for item in data.get(ak, []):
+                fitem = dict(item)
+                for k in ("x", "y", "w", "h"):
+                    if k in fitem:
+                        fitem[k] = float(fitem[k])
+                farr.append(fitem)
+            if farr:
+                fdata[ak] = farr
+        return fdata
+
+    def _synth_data_from_floats(self):
+        if "points" in self._data and "points" in self._float_data:
+            for i, fp in enumerate(self._float_data["points"]):
+                p = self._data["points"][i]
+                p["x"] = int(round(fp["x"]))
+                p["y"] = int(round(fp["y"]))
+        if "sequence" in self._data and "sequence" in self._float_data:
+            for i, fs in enumerate(self._float_data["sequence"]):
+                s = self._data["sequence"][i]
+                if "x" in fs:
+                    s["x"] = int(round(fs["x"]))
+                if "y" in fs:
+                    s["y"] = int(round(fs["y"]))
+                if "w" in fs:
+                    s["w"] = max(1, int(round(fs["w"])))
+                if "h" in fs:
+                    s["h"] = max(1, int(round(fs["h"])))
+
+    def _rebuild_cached_ref_dots(self, ratio, cx, cy):
+        self._cached_ref_dots = []
+        for rd in self._raw_ref_dots:
+            self._cached_ref_dots.append({
+                "x": int(round(cx + (rd["x"] - cx) * ratio)),
+                "y": int(round(cy + (rd["y"] - cy) * ratio)),
+            })
+
+    def _on_scale_changed(self, val):
+        if not self._original_data:
+            return
+        cx, cy = self._center()
+        if cx is None:
+            return
+        prev = max(0.005, self._previous_scale / 100.0)
+        new_ratio = max(0.005, val / 100.0)
+        ratio = new_ratio / prev
+        self._previous_scale = val
+        self._scale_val.setText(str(val))
+        if abs(ratio - 1.0) < 0.0001:
+            return
+        self._apply_scale(ratio, cx, cy)
+
+    def _apply_scale(self, ratio, cx, cy):
+        def sf(val, center):
+            return center + (val - center) * ratio
+        def ss(val):
+            return max(1.0, val * ratio)
+
+        for p in self._float_data.get("points", []):
+            p["x"] = sf(p.get("x", 0.0), cx)
+            p["y"] = sf(p.get("y", 0.0), cy)
+        for s in self._float_data.get("sequence", []):
+            if "x" in s:
+                s["x"] = sf(s.get("x", 0.0), cx)
+            if "y" in s:
+                s["y"] = sf(s.get("y", 0.0), cy)
+            if "w" in s:
+                s["w"] = ss(s.get("w", 1.0))
+            if "h" in s:
+                s["h"] = ss(s.get("h", 1.0))
+
+        self._synth_data_from_floats()
+        self._rebuild_cached_ref_dots(ratio, cx, cy)
+        self._mark_dirty()
+        self._push_dots()
+        self._sync_offset_fields()
+
+    def _sync_offset_fields(self):
+        for array_key in ("points", "sequence"):
+            info = self._array_widgets.get(array_key)
+            if not info:
+                continue
+            arr = self._data.get(array_key, [])
+            for i, w in enumerate(info["widgets"]):
+                if i >= len(arr):
+                    break
+                item = arr[i]
+                for key in ("x", "y", "w", "h"):
+                    if key in item:
+                        w._sync_field(key, item[key])
+                w._summary.setText(w._summary_text())
+
     def _toggle_create_form(self):
         visible = not self._create_form.isVisible()
         self._create_form.setVisible(visible)
@@ -1277,16 +1494,24 @@ class SidebarPanel(QFrame):
         self._mark_clean()
         self._deselect_all()
         self._data = data
+        self._original_data = copy.deepcopy(data)
+        self._float_data = self._build_float_from_data(data)
         self._scalar_edits = {}
         self._array_widgets = {}
         self._disabled_actions = set()
+        self._scale_slider.blockSignals(True)
+        self._scale_slider.setValue(100)
+        self._scale_slider.blockSignals(False)
+        self._scale_val.setText("100")
+        self._previous_scale = 100
+        self._on_snap_quit()
         if not self._uinput_available:
             self._disabled_actions.add("zoom")
         if data.get("screen_cap") is False:
             self._disabled_actions.add("screencap_check")
         if sys.platform != "linux":
             self._disabled_actions.add("zoom")
-            self._data["method"] = "adb-pipe"
+            self._data["method"] = "adb-socket"
 
         self._points_header = None
         self._clear_layout(self._scroll_layout)
@@ -1312,14 +1537,14 @@ class SidebarPanel(QFrame):
                 if key == "method":
                     w.blockSignals(True)
                     w.clear()
-                    w.addItem("adb-pipe", "adb-pipe")
+                    w.addItem("adb-socket", "adb-socket")
                     w.blockSignals(False)
                     w.setEnabled(False)
-                    w.setToolTip("uinput requires Linux, falling back to adb-pipe")
+                    w.setToolTip("uinput requires Linux, falling back to adb-socket")
             elif key == "method" and not self._uinput_available:
                 w.blockSignals(True)
                 w.clear()
-                w.addItem("adb-pipe", "adb-pipe")
+                w.addItem("adb-socket", "adb-socket")
                 w.blockSignals(False)
                 w.setEnabled(False)
                 w.setToolTip("uinput disabled in global config (set uinput=true to enable)")
@@ -1486,6 +1711,7 @@ class SidebarPanel(QFrame):
         self._scroll_content.layout().activate()
         if info and 0 <= index < len(info["widgets"]):
             self._ensure_visible(array_key, index)
+        self._fetch_ref_dots()
         self._push_dots()
         self._update_cursor_btn()
         self._update_referenced()
@@ -1497,10 +1723,44 @@ class SidebarPanel(QFrame):
                 info["widgets"][self._selected_idx].set_selected(False)
         self._selected_array = None
         self._selected_idx = -1
+        self._cached_ref_dots = []
+        self._raw_ref_dots = []
         self._clear_referenced()
         self._push_dots()
         self._update_cursor_btn()
         self._update_referenced()
+
+    def _fetch_ref_dots(self):
+        self._cached_ref_dots = []
+        self._raw_ref_dots = []
+        if self._selected_array != "sequence":
+            return
+        seq = self._data.get("sequence", [])
+        if not (0 <= self._selected_idx < len(seq)):
+            return
+        step = seq[self._selected_idx]
+        if step.get("action") != "run_mode":
+            return
+        mode_name = step.get("mode", "")
+        if not mode_name:
+            return
+        resp = send_cmd("read_mode", mode=mode_name)
+        if not resp or not resp.get("ok"):
+            return
+        ref_data = resp.get("data", {})
+        for p in ref_data.get("points", []):
+            self._raw_ref_dots.append({"x": p.get("x", 0), "y": p.get("y", 0)})
+        for s in ref_data.get("sequence", []):
+            a = s.get("action")
+            if a in ("click", "click_cursor", "area", "zoom", "screencap_check"):
+                if "x" in s and "y" in s:
+                    self._raw_ref_dots.append({"x": s["x"], "y": s["y"]})
+        val = self._scale_slider.value()
+        if self._raw_ref_dots:
+            cx, cy = self._center()
+            if cx is not None:
+                ratio = max(0.005, val / 100.0)
+                self._rebuild_cached_ref_dots(ratio, cx, cy)
 
     # --- Bottom action helpers ---
 
@@ -1586,7 +1846,7 @@ class SidebarPanel(QFrame):
         dots = []
         selected_idx = -1
         data = getattr(self, "_data", {})
-        method = data.get("method", "adb-pipe")
+        method = data.get("method", "adb-socket")
         for p in data.get("points", []):
             dots.append({"type": "dot", "ax": p.get("x", 0), "ay": p.get("y", 0)})
         seq_dot_offset = len(dots)
@@ -1602,6 +1862,15 @@ class SidebarPanel(QFrame):
             elif a == "area":
                 dots.append({"type": "area", "ax": s.get("x", 0), "ay": s.get("y", 0),
                              "aw": s.get("w", 200), "ah": s.get("h", 200), "angle": s.get("angle", 0), "color": "#00c8ff"})
+        for rd in self._cached_ref_dots:
+            dots.append({"type": "run_mode_ref", "ax": rd["x"], "ay": rd["y"]})
+        if self._snap_active and self._snap_rect:
+            r = self._snap_rect
+            dots.append({"type": "area", "_snap": True,
+                         "ax": r["x"], "ay": r["y"],
+                         "aw": r["w"], "ah": r["h"],
+                         "angle": r.get("angle", 0),
+                         "color": "#44ff44"})
         if self._selected_array == "points" and self._selected_idx >= 0:
             if self._selected_idx < len(data.get("points", [])):
                 selected_idx = self._selected_idx
@@ -1609,14 +1878,14 @@ class SidebarPanel(QFrame):
             count = 0
             for i, s in enumerate(data.get("sequence", [])):
                 if i == self._selected_idx:
-                    selected_idx = seq_dot_offset + count
+                    if s.get("action") in ("click", "zoom", "screencap_check", "area"):
+                        selected_idx = seq_dot_offset + count
                     break
                 if s.get("action") in ("click", "zoom", "screencap_check", "area"):
                     count += 1
         if self._android_w is not None:
             self._parent_overlay._android_w = self._android_w
             self._parent_overlay._android_h = self._android_h
-        self._parent_overlay.set_dots(dots, selected_idx)
         self._parent_overlay.set_dots(dots, selected_idx)
 
     # --- Array editor ---
@@ -1692,6 +1961,15 @@ class SidebarPanel(QFrame):
             arr.insert(index, default)
         else:
             arr.append(default)
+        fitem = dict(default)
+        for k in ("x", "y", "w", "h"):
+            if k in fitem:
+                fitem[k] = float(fitem[k])
+        farr = self._float_data.setdefault(array_key, [])
+        if index is not None:
+            farr.insert(index, fitem)
+        else:
+            farr.append(fitem)
         self._mark_dirty()
 
         info = self._array_widgets.get(array_key)
@@ -1746,6 +2024,7 @@ class SidebarPanel(QFrame):
         if self._capture_item:
             self._capture_item._handle_capture(cx, cy)
             self._mark_dirty()
+            self._push_dots()
             return
 
         pt = {"x": cx, "y": cy}
@@ -1756,6 +2035,15 @@ class SidebarPanel(QFrame):
         else:
             insert_idx = len(arr)
             arr.append(pt)
+        fpt = dict(pt)
+        for k in ("x", "y"):
+            if k in fpt:
+                fpt[k] = float(fpt[k])
+        farr = self._float_data.setdefault(self._capture_array_key, [])
+        if self._selected_array == self._capture_array_key and self._selected_idx >= 0:
+            farr.insert(insert_idx, fpt)
+        else:
+            farr.append(fpt)
         self._mark_dirty()
 
         info = self._array_widgets.get(self._capture_array_key)
@@ -1793,10 +2081,87 @@ class SidebarPanel(QFrame):
         if self._parent_overlay._autohide_sidebar:
             self.show()
 
+    # --- Snap alignment ---
+
+    def _toggle_snap(self):
+        self._snap_active = True
+        self._snap_btn.setVisible(False)
+        self._snap_row.setVisible(True)
+        cx, cy = self._center()
+        if cx is None:
+            cx, cy = 540, 960
+        self._snap_rect = {"x": cx, "y": cy, "w": 200, "h": 200, "angle": 0}
+        self._push_dots()
+
+    def _on_snap_quit(self):
+        self._snap_active = False
+        self._snap_rect = None
+        self._snap_btn.setVisible(True)
+        self._snap_row.setVisible(False)
+        self._push_dots()
+
+    def _point_in_rect(self, px, py, rect):
+        rad = math.radians(-rect["angle"])
+        tx = px - rect["x"]
+        ty = py - rect["y"]
+        rx = tx * math.cos(rad) - ty * math.sin(rad)
+        ry = tx * math.sin(rad) + ty * math.cos(rad)
+        return abs(rx) <= rect["w"] / 2 and abs(ry) <= rect["h"] / 2
+
+    def _snap_coords(self, axis):
+        if self._selected_array is None or self._selected_idx < 0:
+            return
+        if not self._snap_rect:
+            return
+        ref_arr = self._data.get(self._selected_array, [])
+        if not (0 <= self._selected_idx < len(ref_arr)):
+            return
+        ref = ref_arr[self._selected_idx]
+        snap_val = ref.get("x" if axis == "x" else "y")
+        if snap_val is None:
+            return
+        range_val = self._snap_range_spin.value()
+        changed = False
+        for ak in ("points", "sequence"):
+            arr = self._data.get(ak, [])
+            farr = self._float_data.get(ak, [])
+            for i, item in enumerate(arr):
+                coord = item.get("x" if axis == "x" else "y")
+                if coord is None:
+                    continue
+                if abs(coord - snap_val) > range_val:
+                    continue
+                if not self._point_in_rect(
+                    item.get("x", 0), item.get("y", 0), self._snap_rect
+                ):
+                    continue
+                if axis == "x":
+                    item["x"] = snap_val
+                    if i < len(farr):
+                        farr[i]["x"] = float(snap_val)
+                else:
+                    item["y"] = snap_val
+                    if i < len(farr):
+                        farr[i]["y"] = float(snap_val)
+                changed = True
+        if changed:
+            self._mark_dirty()
+            self._push_dots()
+            self._sync_offset_fields()
+
+    def _on_snap_x(self):
+        self._snap_coords("x")
+
+    def _on_snap_y(self):
+        self._snap_coords("y")
+
     def _remove_array_item(self, array_key, index):
         arr = self._data.get(array_key, [])
         if 0 <= index < len(arr):
             arr.pop(index)
+        farr = self._float_data.get(array_key, [])
+        if 0 <= index < len(farr):
+            farr.pop(index)
         self._mark_dirty()
 
         info = self._array_widgets.get(array_key)
@@ -1834,6 +2199,10 @@ class SidebarPanel(QFrame):
             to_idx -= 1
         arr.insert(to_idx, item)
         self._mark_dirty()
+        farr = self._float_data.get(array_key, [])
+        if farr and 0 <= from_idx < len(farr):
+            fitem = farr.pop(from_idx)
+            farr.insert(to_idx, fitem)
 
         info = self._array_widgets.get(array_key)
         if not info:
@@ -1932,10 +2301,30 @@ class SidebarPanel(QFrame):
                 if items or array_key in self._data:
                     data[array_key] = items
         self._data = data
+        self._float_data = self._build_float_from_data(data)
+        for array_key in ("points", "sequence"):
+            info = self._array_widgets.get(array_key)
+            if info:
+                arr = self._data.get(array_key, [])
+                for i, w in enumerate(info["widgets"]):
+                    if i < len(arr):
+                        w._item = arr[i]
         self._mark_clean()
         self._push_dots()
         send_cmd("save_mode", mode=self._mode_name, data=data)
         self._show_feedback("Saved to file")
+        self._scale_slider.blockSignals(True)
+        self._scale_slider.setValue(100)
+        self._scale_slider.blockSignals(False)
+        self._scale_val.setText("100")
+        self._previous_scale = 100
+
+    def _on_reset(self):
+        if not self._confirm_discard():
+            return
+        resp = send_cmd("read_mode", mode=self._mode_name)
+        if resp and resp.get("ok"):
+            self._rebuild_config(resp.get("data", {}))
 
 
 class OverlayWindow(QWidget):
@@ -2058,8 +2447,9 @@ class OverlayWindow(QWidget):
             return ax, ay
         return ox + self.x(), oy + self.y()
 
-    def _draw_dot(self, p, ox, oy, highlight):
-        color = QColor("#ffb217") if highlight else QColor("#64c8ff")
+    def _draw_dot(self, p, ox, oy, highlight, color=None):
+        base = QColor(color) if color else QColor("#64c8ff")
+        color = QColor("#ffb217") if highlight else base
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(color)
         p.drawEllipse(ox - 4, oy - 4, 8, 8)
@@ -2155,7 +2545,8 @@ class OverlayWindow(QWidget):
                 ldx = (click_ax - cac[0]) * math.cos(-rad) - (click_ay - cac[1]) * math.sin(-rad)
                 ldy = (click_ax - cac[0]) * math.sin(-rad) + (click_ay - cac[1]) * math.cos(-rad)
                 if -aw/2 - 5 <= ldx <= aw/2 + 5 and -ah/2 - 5 <= ldy <= ah/2 + 5:
-                    return idx
+                    if best is None:
+                        best = idx
             else:
                 d2 = dx*dx + dy*dy
                 if d2 < best_d2:
@@ -2186,6 +2577,8 @@ class OverlayWindow(QWidget):
             highlight = idx == self._selected_dot_idx
             if t == "dot":
                 self._draw_dot(p, ox, oy, highlight)
+            elif t == "run_mode_ref":
+                self._draw_dot(p, ox, oy, highlight, color="#c864ff")
             elif t == "zoom":
                 self._draw_zoom(p, ox, oy, highlight)
             elif t == "area":
@@ -2221,22 +2614,31 @@ class OverlayWindow(QWidget):
                     self._sidebar._add_captured_point()
                     event.accept()
                     return
-            else:
-                idx = self._hit_test_dots(event.pos())
-                if idx is not None:
-                    self._sidebar._select_from_dots_idx(idx)
-                    d = self._dots_data[idx]
-                    t = d.get("type")
-                    if t in ("dot", "zoom", "area"):
-                        self._drag_idx = idx
-                        self._drag_ref = (self._sidebar._selected_array,
-                                          self._sidebar._selected_idx)
-                        self._drag_handle = ""
-                        ox, oy = self._to_overlay(d["ax"], d["ay"])
-                        self._drag_off_x = event.pos().x() - ox
-                        self._drag_off_y = event.pos().y() - oy
+            idx = self._hit_test_dots(event.pos())
+            if idx is not None:
+                d = self._dots_data[idx]
+                if d.get("_snap"):
+                    self._drag_idx = idx
+                    self._selected_dot_idx = idx
+                    self._drag_ref = None
+                    self._drag_handle = ""
+                    ox, oy = self._to_overlay(d["ax"], d["ay"])
+                    self._drag_off_x = event.pos().x() - ox
+                    self._drag_off_y = event.pos().y() - oy
                     event.accept()
                     return
+                self._sidebar._select_from_dots_idx(idx)
+                t = d.get("type")
+                if t in ("dot", "zoom", "area"):
+                    self._drag_idx = idx
+                    self._drag_ref = (self._sidebar._selected_array,
+                                      self._sidebar._selected_idx)
+                    self._drag_handle = ""
+                    ox, oy = self._to_overlay(d["ax"], d["ay"])
+                    self._drag_off_x = event.pos().x() - ox
+                    self._drag_off_y = event.pos().y() - oy
+                event.accept()
+                return
 
         elif btn == Qt.MouseButton.RightButton:
             search = ([self._selected_dot_idx]
@@ -2247,6 +2649,18 @@ class OverlayWindow(QWidget):
                 if d.get("type") == "area":
                     handle = self._hit_test_rect_handle(event.pos(), idx, d)
                     if handle:
+                        if d.get("_snap"):
+                            self._drag_idx = idx
+                            self._selected_dot_idx = idx
+                            self._drag_ref = None
+                            self._drag_handle = handle
+                            self._drag_start_rect = (d["ax"], d["ay"],
+                                                      d["aw"], d["ah"])
+                            self._drag_start_mouse = self._to_android(
+                                event.pos().x(), event.pos().y())
+                            self._drag_start_angle = d.get("angle", 0)
+                            event.accept()
+                            return
                         self._sidebar._select_from_dots_idx(idx)
                         self._drag_idx = idx
                         self._drag_ref = (self._sidebar._selected_array,
@@ -2271,6 +2685,13 @@ class OverlayWindow(QWidget):
         if self._drag_idx >= 0 and event.button() in (
                 Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             self._update_drag(event.pos())
+            d = self._dots_data[self._drag_idx]
+            if d.get("_snap"):
+                self._sidebar._snap_rect = {
+                    "x": d["ax"], "y": d["ay"],
+                    "w": d["aw"], "h": d["ah"],
+                    "angle": d.get("angle", 0)
+                }
             self._sidebar._mark_dirty()
             self._sidebar._push_dots()
             self._drag_idx = -1
@@ -2309,37 +2730,6 @@ class OverlayWindow(QWidget):
                     nh = max(10, int(abs(ldy) * 2))
                     d["aw"], d["ah"] = nw, nh
                     updates = {"w": nw, "h": nh}
-            else:
-                sax, say, saw, sah = self._drag_start_rect
-                smx, smy = self._drag_start_mouse
-                cmx, cmy = self._to_android(pos.x(), pos.y())
-                dx = cmx - smx
-                dy = cmy - smy
-                if self._drag_handle == "tl":
-                    nx = sax + dx
-                    ny = say + dy
-                    nw = saw - dx
-                    nh = sah - dy
-                    if nw < 10:
-                        nw = 10
-                        nx = sax + saw - 10
-                    if nh < 10:
-                        nh = 10
-                        ny = say + sah - 10
-                else:
-                    nx = sax
-                    ny = say
-                    nw = saw + dx
-                    nh = sah + dy
-                    if nw < 10:
-                        nw = 10
-                    if nh < 10:
-                        nh = 10
-                d["ax"] = nx
-                d["ay"] = ny
-                d["aw"] = nw
-                d["ah"] = nh
-                updates = {"x": nx, "y": ny, "w": nw, "h": nh}
         else:
             new_ox = pos.x() - self._drag_off_x
             new_oy = pos.y() - self._drag_off_y
@@ -2354,6 +2744,12 @@ class OverlayWindow(QWidget):
             if arr and 0 <= ai < len(arr):
                 for key, v in updates.items():
                     arr[ai][key] = v
+                fdata = getattr(self._sidebar, "_float_data", {})
+                farr = fdata.get(ak)
+                if farr and 0 <= ai < len(farr):
+                    for key, v in updates.items():
+                        if key in ("x", "y", "w", "h"):
+                            farr[ai][key] = float(v)
                 info = self._sidebar._array_widgets.get(ak)
                 if info and 0 <= ai < len(info["widgets"]):
                     w = info["widgets"][ai]

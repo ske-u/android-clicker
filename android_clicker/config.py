@@ -114,8 +114,8 @@ def save_config(data):
 
 
 FIXED_CREATE_TEMPLATE = """\
-method = "adb-pipe"                                                                                          # Injection backend: adb-pipe or uinput
-interval = 15                                                                                                # ms between clicks
+method = "adb-socket"                                                                                          # Injection backend: adb-socket or uinput
+interval = 15                                                                                                 # ms between clicks
 jitter_px = 5                                                                                                # random offset on click x/y
 jitter_ms = 5                                                                                                # random offset on interval
 reset_timer = 10000                                                                                          # ms before cycling back to first point (stop timer when repeat=false)
@@ -133,7 +133,7 @@ points = [
 """
 
 CUSTOM_CREATE_TEMPLATE = """\
-method = "adb-pipe"       # Injection backend: adb-pipe or uinput
+method = "adb-socket"       # Injection backend: adb-socket or uinput
 screen_cap = false        # Enable screencap_check action (uses ADB regardless of method)
 interval = 15             # ms between click repeats
 jitter_px = 5             # random offset on click x/y

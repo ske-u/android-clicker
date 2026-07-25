@@ -307,7 +307,7 @@ def main():
     mt = _p(sub, "method", help="Show/switch injection backend")
     mts = mt.add_subparsers(dest="method_action", metavar="[method]")
     for name, h in [
-        ("adb-pipe", "Switch to ADB pipe injector"),
+        ("adb-socket", "Switch to ADB socket injector"),
         ("uinput", "Switch to uinput injector"),
     ]:
         _p(mts, name, help=h)
