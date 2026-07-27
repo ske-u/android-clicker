@@ -401,6 +401,7 @@ _CONFIG_DISPLAY_NAMES = {
     "burst_clicks_plus": "burst clicks +",
     "burst_clicks_minus": "burst clicks -",
     "uinput":              "uinput",
+    "app_process":         "app_process",
     "target_app":          "target app",
 }
 
@@ -416,6 +417,7 @@ class ConfigEditorWindow(QWidget):
         ]),
         ("Input", [
             ("uinput", "uinput", "combo", ["false", "true"]),
+            ("app_process", "app_process", "combo", ["false", "true"]),
         ]),
         ("Display", [
             ("android_width", "display.android_width", "text", None),
@@ -505,7 +507,7 @@ class ConfigEditorWindow(QWidget):
                 elif wtype == "text":
                     w = QLineEdit()
                     if sys.platform != "win32" and path == "adb.exe_path":
-                        w.setPlaceholderText("Windows-only setting")
+                        w.setPlaceholderText("Windows-only")
                         w.setEnabled(False)
                     else:
                         ph = {

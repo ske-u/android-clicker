@@ -3,6 +3,7 @@
 # active = true                        # enable clicking on daemon start
 # mode = "fixed.myvariant"
 # uinput = false                       # enable persistent uinput device (requires python-evdev + input group)
+# app_process = false                  # enable app_process injection backend (pushes JAR via ADB)
 #
 # [launcher]
 # auto_start_daemon = false
@@ -39,6 +40,7 @@
 active = false
 mode = "follow"
 uinput = false
+app_process = false
 
 [launcher]
 auto_start_daemon = false

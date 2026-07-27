@@ -14,8 +14,10 @@ from .config import (
     MODECONFIG_DIR, FIXED_CREATE_TEMPLATE, CUSTOM_CREATE_TEMPLATE, SCRIPT_DIR,
 )
 from .injectors import (
-    create_injector, create_shared_uinput, available_methods, get_adb_wm_size, ensure_adb,
-    set_adb_path, detect_adb_path, set_adb_serial,
+    create_injector, create_uinput_device, push_jar,
+    available_methods, get_adb_wm_size, ensure_adb,
+    set_adb_path, detect_adb_path, set_adb_serial, set_app_process_enabled,
+    get_app_process_enabled,
 )
 from .hotkeys import HotkeyListener
 from .modes import create_modes
@@ -56,12 +58,15 @@ class ClickDaemon:
             self.host_w, self.host_h = res
 
         uinput_cfg = config.get("uinput", False)
-        self._shared_uinput = None
+        self._uinput_device = None
         if uinput_cfg:
             try:
-                self._shared_uinput = create_shared_uinput(self.host_w, self.host_h)
+                self._uinput_device = create_uinput_device(self.host_w, self.host_h)
             except Exception as e:
                 print(f"warning: uinput init failed ({e}); falling back to adb-socket", file=sys.stderr)
+
+        ap_cfg = config.get("app_process", False)
+        set_app_process_enabled(ap_cfg)
 
         adb_cfg = config.get("adb", {})
         adb_connect = adb_cfg.get("connect")
@@ -82,6 +87,12 @@ class ClickDaemon:
 
         ensure_adb(adb_connect, timeout=adb_timeout)
 
+        if ap_cfg:
+            try:
+                push_jar(adb_connect, timeout=adb_timeout)
+            except Exception as e:
+                print(f"warning: jar push failed: {e}", file=sys.stderr)
+
         self.android_w, self.android_h = self._detect_android_resolution()
         self._update_window()
 
@@ -90,7 +101,7 @@ class ClickDaemon:
         if method == "adb-pipe":
             method = "adb-socket"
         result = create_injector(method, self.host_w, self.host_h,
-                                 shared_uinput=self._shared_uinput,
+                                 uinput_device=self._uinput_device,
                                  adb_connect=adb_connect,
                                  adb_timeout=adb_timeout)
         if result is None:
@@ -104,6 +115,10 @@ class ClickDaemon:
         else:
             self.current_mode = next(iter(self.modes.values()))
             self.mode = self.current_mode.name
+
+        if hasattr(self.current_mode, '_zoom_injector'):
+            if not self.injector.supports_zoom and self._has_zoom(mode_cfg):
+                self.current_mode._zoom_injector = self._create_zoom_fallback()
 
         self.window_bounds = None
         self.last_window_check = 0.0
@@ -230,10 +245,15 @@ class ClickDaemon:
         if name not in self.modes:
             return False
         old_method = self.method_name
+        old_mode = self.current_mode
         self.mode = name
         self.current_mode = self.modes[name]
         self.current_mode.reset()
         self._next_click = 0.0
+
+        if hasattr(old_mode, '_zoom_injector') and old_mode._zoom_injector:
+            old_mode._zoom_injector.close()
+            old_mode._zoom_injector = None
 
         mode_cfg = load_modeconfig(name)
         new_method = mode_cfg.get("method", "adb-socket")
@@ -242,7 +262,7 @@ class ClickDaemon:
 
         if new_method != old_method:
             result = create_injector(new_method, self.host_w, self.host_h,
-                                     shared_uinput=self._shared_uinput,
+                                     uinput_device=self._uinput_device,
                                      adb_connect=self.adb_connect,
                                      adb_timeout=self.adb_timeout)
             if result:
@@ -251,6 +271,16 @@ class ClickDaemon:
                 self.injector = inj
                 self.method_name = actual_method
                 old.close()
+                for m in self.modes.values():
+                    m.injector = inj
+
+        if hasattr(self.current_mode, '_zoom_injector'):
+            if not self.injector.supports_zoom and self._has_zoom(mode_cfg):
+                if self.current_mode._zoom_injector is None:
+                    self.current_mode._zoom_injector = self._create_zoom_fallback()
+            elif self.current_mode._zoom_injector is not None:
+                self.current_mode._zoom_injector.close()
+                self.current_mode._zoom_injector = None
 
         if self._should_notify():
             self.platform.notify(f"mode: {name}")
@@ -284,7 +314,35 @@ class ClickDaemon:
 
     @property
     def uinput_available(self):
-        return self._shared_uinput is not None
+        return self._uinput_device is not None
+
+    @staticmethod
+    def _has_zoom(mode_cfg):
+        return any(s.get("action") == "zoom" for s in mode_cfg.get("sequence", []))
+
+    def _close_zoom_injector(self, mode_obj=None):
+        obj = mode_obj or self.current_mode
+        if hasattr(obj, '_zoom_injector') and obj._zoom_injector:
+            obj._zoom_injector.close()
+            obj._zoom_injector = None
+
+    def _create_zoom_fallback(self):
+        if get_app_process_enabled():
+            try:
+                from .injectors import AppProcessInjector
+                return AppProcessInjector(
+                    adb_connect=self.adb_connect, timeout=self.adb_timeout)
+            except Exception as e:
+                print(f"warning: zoom fallback (app-process) failed: {e}", file=sys.stderr)
+        if self._uinput_device is not None:
+            try:
+                from .injectors import UinputInjector
+                return UinputInjector(
+                    host_w=self.host_w, host_h=self.host_h,
+                    uinput_device=self._uinput_device)
+            except Exception as e:
+                print(f"warning: zoom fallback (uinput) failed: {e}", file=sys.stderr)
+        return None
 
     def get_cursor_pos(self) -> tuple[int, int]:
         return self.platform.get_cursor_position()
@@ -468,9 +526,37 @@ class ClickDaemon:
             if data.get("method") == "adb-pipe":
                 data["method"] = "adb-socket"
             save_modeconfig(mode, data)
+
+            new_method = data.get("method", "adb-socket")
+            if new_method != self.method_name:
+                result = create_injector(new_method, self.host_w, self.host_h,
+                                         uinput_device=self._uinput_device,
+                                         adb_connect=self.adb_connect,
+                                         adb_timeout=self.adb_timeout)
+                if result:
+                    inj, actual_method = result
+                    old = self.injector
+                    self.injector = inj
+                    self.method_name = actual_method
+                    old.close()
+                    for m in self.modes.values():
+                        m.injector = inj
+                else:
+                    print(f"warning: save_mode: {new_method} injector creation failed, keeping {self.method_name}", file=sys.stderr)
+
+            self._close_zoom_injector()
             self.modes = create_modes(self.injector, self)
             if self.mode in self.modes:
                 self.current_mode = self.modes[self.mode]
+
+            if mode == self.mode and hasattr(self.current_mode, '_zoom_injector'):
+                if not self.injector.supports_zoom and self._has_zoom(data):
+                    if self.current_mode._zoom_injector is None:
+                        self.current_mode._zoom_injector = self._create_zoom_fallback()
+                elif self.current_mode._zoom_injector is not None:
+                    self.current_mode._zoom_injector.close()
+                    self.current_mode._zoom_injector = None
+
             return {"ok": True}
 
         if cmd == "create_mode":
@@ -484,6 +570,7 @@ class ClickDaemon:
             path = os.path.join(MODECONFIG_DIR, f"{full_name}.toml")
             with open(path, "w", encoding='utf-8') as f:
                 f.write(template)
+            self._close_zoom_injector()
             self.modes = create_modes(self.injector, self)
             data = load_modeconfig(full_name)
             return {"ok": True, "mode": full_name, "data": data}
@@ -493,6 +580,7 @@ class ClickDaemon:
             path = os.path.join(MODECONFIG_DIR, f"{mode}.toml")
             if os.path.exists(path):
                 os.remove(path)
+            self._close_zoom_injector()
             self.modes = create_modes(self.injector, self)
             if self.mode == mode or self.mode not in self.modes:
                 self.current_mode = next(iter(self.modes.values()))
@@ -510,12 +598,14 @@ class ClickDaemon:
             if name:
                 if self.mode != "follow":
                     return {"ok": False, "error": "method switch only allowed in follow mode"}
-                if name == "uinput" and self._shared_uinput is None:
+                if name == "uinput" and self._uinput_device is None:
                     return {"ok": False, "error": "uinput not available (set uinput=true in config)"}
+                if name == "app-process" and not get_app_process_enabled():
+                    return {"ok": False, "error": "app-process not available (set app_process=true in config)"}
                 if name == "adb-pipe":
                     name = "adb-socket"
                 result = create_injector(name, self.host_w, self.host_h,
-                                         shared_uinput=self._shared_uinput,
+                                         uinput_device=self._uinput_device,
                                          adb_connect=self.adb_connect,
                                          adb_timeout=self.adb_timeout)
                 if result is None:
@@ -526,11 +616,13 @@ class ClickDaemon:
                 self.method_name = actual_method
                 if old:
                     old.close()
+                for m in self.modes.values():
+                    m.injector = self.injector
                 if n():
                     self.platform.notify(f"method: {actual_method}")
                 return {"ok": True, "message": actual_method}
             return {"ok": True, "data": {"method": self.method_name,
-                                          "available": available_methods(self._shared_uinput is not None)}}
+                                          "available": available_methods(self._uinput_device is not None, get_app_process_enabled())}}
 
         if cmd == "stop":
             self.running = False
@@ -579,6 +671,8 @@ class ClickDaemon:
                     "window_bounds": self.window_bounds,
                     "android_resolution": {"w": self.android_w, "h": self.android_h},
                     "uinput_available": self.uinput_available,
+                    "methods_available": available_methods(
+                        self._uinput_device is not None, get_app_process_enabled()),
                     "overlay_state": {
                         **self.overlay_state,
                         "overlay_running": self._overlay_proc is not None
@@ -654,8 +748,11 @@ class ClickDaemon:
         self._kill_proc(self._launcher_proc)
         self._kill_proc(self._overlay_proc)
         self.injector.close()
-        if self._shared_uinput:
-            ui, _ = self._shared_uinput
+        if hasattr(self.current_mode, '_zoom_injector') and self.current_mode._zoom_injector:
+            self.current_mode._zoom_injector.close()
+            self.current_mode._zoom_injector = None
+        if self._uinput_device:
+            ui, _ = self._uinput_device
             ui.close()
         if self._should_notify():
             self.platform.notify("daemon stopped")

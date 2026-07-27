@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 
 ADB_PATH = "adb"
 ADB_SERIAL = ""
@@ -17,6 +18,20 @@ def set_adb_path(v):
 def set_adb_serial(v):
     global ADB_SERIAL
     ADB_SERIAL = v
+
+APP_PROCESS_ENABLED = False
+
+def set_app_process_enabled(v):
+    global APP_PROCESS_ENABLED
+    APP_PROCESS_ENABLED = v
+
+def get_app_process_enabled():
+    return APP_PROCESS_ENABLED
+
+JAR_NAME = "injector.jar"
+JAR_REMOTE = "/data/local/tmp/injector.jar"
+LOCAL_PORT = 17000
+REMOTE_PORT = 17000
 
 def _adb_cmd(*args):
     cmd = [ADB_PATH]
@@ -39,16 +54,29 @@ def detect_adb_path():
                 return path
     return "adb"
 
-METHODS = ["adb-socket", "uinput"]
+METHODS = ["adb-socket", "uinput", "app-process"]
 
 
-def available_methods(uinput_enabled=False):
+def available_methods(uinput_enabled=False, app_process_enabled=False):
+    m = ["adb-socket"]
+    if app_process_enabled:
+        m.append("app-process")
     if sys.platform == "linux" and uinput_enabled:
-        return list(METHODS)
-    return ["adb-socket"]
+        m.append("uinput")
+    return m
 
 
-def create_shared_uinput(host_w, host_h):
+def push_jar(adb_connect, timeout=5):
+    set_adb_serial(adb_connect)
+    jar_local = os.path.join(os.path.dirname(__file__), JAR_NAME)
+    try:
+        subprocess.run(_adb_cmd("push", jar_local, JAR_REMOTE),
+                       capture_output=True, timeout=timeout)
+    except Exception:
+        pass
+
+
+def create_uinput_device(host_w, host_h):
     """Create the daemon-level persistent uinput device. Returns (ui, e) or raises."""
     from evdev import UInput, ecodes as e, AbsInfo
     ui = UInput(
@@ -69,11 +97,16 @@ def create_shared_uinput(host_w, host_h):
 
 class BaseInjector:
     coord_space = "android"
+    supports_zoom = False
 
     def tap(self, x, y):
         raise NotImplementedError
-    def zoom(self, x, y, amount, duration=200, spread=20, steps=10):
-        raise NotImplementedError
+    def zoom_start(self, lx, rx, center_y):
+        pass
+    def zoom_tick(self, sx, dx, center_y):
+        pass
+    def zoom_end(self):
+        pass
     def close(self):
         pass
     def drain(self):
@@ -129,7 +162,7 @@ class AdbSocketInjector(BaseInjector):
         self._closed = False
         self._shell_pid = None
         self.sock = None
-        self._queue = queue.Queue(maxsize=10000)
+        self._queue = queue.Queue(maxsize=250)
         self._connect()
         self._worker = threading.Thread(target=self._writer, daemon=True)
         self._worker.start()
@@ -243,30 +276,10 @@ class AdbSocketInjector(BaseInjector):
 
 class UinputInjector(BaseInjector):
     coord_space = "host"
+    supports_zoom = True
 
-    def __init__(self, host_w, host_h, shared=None):
-        if shared:
-            self.ui, self.e = shared
-            self._shared = True
-        else:
-            from evdev import UInput, ecodes as e, AbsInfo
-            self.e = e
-            self.ui = UInput(
-                {
-                    e.EV_KEY: [e.BTN_TOUCH],
-                    e.EV_ABS: [
-                        (e.ABS_MT_SLOT, AbsInfo(0, 0, 9, 0, 0, 0)),
-                        (e.ABS_MT_TRACKING_ID, AbsInfo(0, 0, 65535, 0, 0, 0)),
-                        (e.ABS_MT_POSITION_X, AbsInfo(0, 0, host_w - 1, 0, 0, 0)),
-                        (e.ABS_MT_POSITION_Y, AbsInfo(0, 0, host_h - 1, 0, 0, 0)),
-                        (e.ABS_MT_PRESSURE, AbsInfo(0, 0, 255, 0, 0, 0)),
-                    ],
-                },
-                name="android-clicker-touch",
-                phys="android-clicker/input0",
-                input_props=(e.INPUT_PROP_DIRECT,),
-            )
-            self._shared = False
+    def __init__(self, host_w, host_h, uinput_device):
+        self.ui, self.e = uinput_device
 
     def tap(self, x, y):
         e = self.e
@@ -282,32 +295,234 @@ class UinputInjector(BaseInjector):
         self.ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
         self.ui.syn()
 
+    def zoom_start(self, lx, rx, center_y):
+        e = self.e
+        self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 0)
+        self.ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, 1)
+        self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, lx)
+        self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_Y, center_y)
+        self.ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 100)
+        self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 1)
+        self.ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, 2)
+        self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, rx)
+        self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_Y, center_y)
+        self.ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 100)
+        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
+        self.ui.syn()
+
+    def zoom_tick(self, sx, dx, center_y):
+        e = self.e
+        self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 0)
+        self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, sx)
+        self.ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 100)
+        self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 1)
+        self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, dx)
+        self.ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 100)
+        self.ui.syn()
+
+    def zoom_end(self):
+        e = self.e
+        self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 0)
+        self.ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+        self.ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 0)
+        self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 1)
+        self.ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+        self.ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 0)
+        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
+        self.ui.syn()
+
     def close(self):
-        if not self._shared:
-            self.ui.close()
+        pass
+
+
+class AppProcessInjector(BaseInjector):
+    coord_space = "android"
+    supports_zoom = True
+
+    def __init__(self, adb_connect, timeout=5):
+        ensure_adb(adb_connect, timeout=timeout)
+        self._dead = False
+        self._closed = False
+        self._proc = None
+        self._sock = None
+
+        subprocess.run(
+            _adb_cmd("forward", f"tcp:{LOCAL_PORT}", f"tcp:{REMOTE_PORT}"),
+            capture_output=True, timeout=timeout,
+        )
+
+        self._proc = subprocess.Popen(
+            _adb_cmd("shell",
+                     f"CLASSPATH={JAR_REMOTE}",
+                     "app_process", "/", "com.clicker.Injector",
+                     str(REMOTE_PORT)),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        self._sock = self._connect_retry(timeout)
+
+        self._queue = queue.Queue(maxsize=250)
+        self._worker = threading.Thread(target=self._writer, daemon=True)
+        self._worker.start()
+
+    def _connect_retry(self, timeout):
+        deadline = time.monotonic() + timeout
+        last_err = None
+        while time.monotonic() < deadline:
+            try:
+                s = socket.create_connection(("127.0.0.1", LOCAL_PORT), timeout=2)
+                return s
+            except ConnectionRefusedError as e:
+                last_err = e
+                time.sleep(0.3)
+        raise ConnectionError(f"app_process not ready in {timeout}s")
+
+    def _reconnect(self, timeout=5):
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        subprocess.run(_adb_cmd("forward", "--remove", f"tcp:{LOCAL_PORT}"),
+                       capture_output=True, timeout=timeout)
+        subprocess.run(_adb_cmd("forward", f"tcp:{LOCAL_PORT}", f"tcp:{REMOTE_PORT}"),
+                       capture_output=True, timeout=timeout)
+        self._proc = subprocess.Popen(
+            _adb_cmd("shell", f"CLASSPATH={JAR_REMOTE}",
+                     "app_process", "/", "com.clicker.Injector", str(REMOTE_PORT)),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._sock = self._connect_retry(timeout)
+        self._dead = False
+
+    def _writer(self):
+        while not self._dead:
+            try:
+                cmd = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._sock.sendall(cmd.encode() + b"\n")
+                self._sock.recv(1024)
+            except OSError:
+                if self._closed:
+                    self._dead = True
+                    break
+                try:
+                    self._reconnect(5)
+                except (ConnectionError, OSError, subprocess.TimeoutExpired):
+                    self._dead = True
+                    break
+
+    def tap(self, x, y):
+        if self._dead:
+            return
+        try:
+            self._queue.put_nowait(f"T {x} {y}")
+        except queue.Full:
+            pass
+
+    def zoom_start(self, lx, rx, center_y):
+        if self._dead:
+            return
+        try:
+            self._queue.put_nowait(f"D {lx} {center_y} {rx} {center_y}")
+        except queue.Full:
+            pass
+
+    def zoom_tick(self, sx, dx, center_y):
+        if self._dead:
+            return
+        try:
+            self._queue.put_nowait(f"M {sx} {center_y} {dx} {center_y}")
+        except queue.Full:
+            pass
+
+    def zoom_end(self):
+        if self._dead:
+            return
+        try:
+            self._queue.put_nowait("U")
+        except queue.Full:
+            pass
+
+    def healthy(self) -> bool:
+        return not self._dead
+
+    def drain(self):
+        self._dead = True
+        if self._sock:
+            self._sock.setblocking(False)
+            try:
+                while self._queue.get_nowait():
+                    pass
+            except queue.Empty:
+                pass
+            try:
+                while self._sock.recv(4096):
+                    pass
+            except (BlockingIOError, OSError):
+                pass
+            self._sock.setblocking(True)
+        self._dead = False
+        self._worker = threading.Thread(target=self._writer, daemon=True)
+        self._worker.start()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._dead = True
+        if self._sock:
+            try:
+                self._sock.sendall(b"Q\n")
+                self._sock.recv(1024)
+            except OSError:
+                pass
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        subprocess.run(_adb_cmd("forward", "--remove", f"tcp:{LOCAL_PORT}"),
+                       capture_output=True, timeout=3)
+        if self._proc:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
 
 
 INJECTOR_CLASSES = {
     "adb-socket": AdbSocketInjector,
     "adb-pipe": AdbSocketInjector,
     "uinput": UinputInjector,
+    "app-process": AppProcessInjector,
 }
 
 
-def create_injector(method, host_w, host_h, shared_uinput=None, adb_connect=None, adb_timeout=5):
+def create_injector(method, host_w, host_h, uinput_device=None, adb_connect=None, adb_timeout=5):
     if method == "uinput":
         if sys.platform != "linux":
             print("warning: uinput requires Linux, falling back to adb-socket", file=sys.stderr)
             method = "adb-socket"
-        elif shared_uinput is None:
+        elif uinput_device is None:
             print("warning: uinput disabled globally, falling back to adb-socket", file=sys.stderr)
             method = "adb-socket"
+    if method == "app-process" and not APP_PROCESS_ENABLED:
+        print("warning: app_process disabled globally, falling back to adb-socket", file=sys.stderr)
+        method = "adb-socket"
     cls = INJECTOR_CLASSES.get(method)
     if cls is None:
         return None
     try:
         if cls is UinputInjector:
-            return (cls(host_w=host_w, host_h=host_h, shared=shared_uinput), method)
+            return (cls(host_w=host_w, host_h=host_h, uinput_device=uinput_device), method)
+        if cls is AppProcessInjector:
+            return (cls(adb_connect=adb_connect, timeout=adb_timeout), method)
         return (cls(adb_connect=adb_connect, timeout=adb_timeout), method)
     except ImportError:
         print(f"error: {method} requires python-evdev (pip install python-evdev)", file=sys.stderr)

@@ -41,7 +41,9 @@ class CustomMode(BaseMode):
         self._run_proc = None
         self._run_start = 0.0
         self._run_timeout = 0.0
+        self._zoom_step = 0
         self._zoom_state = None
+        self._zoom_injector = None
         self._then_idx = None
 
     def _get_config(self):
@@ -75,6 +77,10 @@ class CustomMode(BaseMode):
         self._repeat_area = False
         self._repeat_positions = None
         self._repeat_prev = None
+        if self._zoom_step > 0:
+            zoom_inj = self._zoom_injector if self._zoom_injector else self.injector
+            zoom_inj.zoom_end()
+        self._zoom_step = 0
         self._zoom_state = None
         self._then_idx = None
         if self._run_proc is not None:
@@ -158,32 +164,19 @@ class CustomMode(BaseMode):
                 self.next_time = now + 0.05
             return
 
-        if self._zoom_state is not None:
+        if self._zoom_step > 0:
             zs = self._zoom_state
-            ui, e = self.daemon._shared_uinput
-            progress = zs["step"] / zs["steps"]
-            spread_pct = zs["start_pct"] + (zs["end_pct"] - zs["start_pct"]) * progress
-            half = zs["dimension"] * spread_pct / 100 / 2
-            sx = int(zs["center_x"] - half)
-            dx = int(zs["center_x"] + half)
-            ui.write(e.EV_ABS, e.ABS_MT_SLOT, 0)
-            ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, sx)
-            ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 100)
-            ui.write(e.EV_ABS, e.ABS_MT_SLOT, 1)
-            ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, dx)
-            ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 100)
-            ui.syn()
-            zs["step"] += 1
-            if zs["step"] > zs["steps"]:
-                ui.write(e.EV_ABS, e.ABS_MT_SLOT, 0)
-                ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
-                ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 0)
-                ui.write(e.EV_ABS, e.ABS_MT_SLOT, 1)
-                ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
-                ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 0)
-                ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
-                ui.syn()
-                self._zoom_state = None
+            progress = self._zoom_step / zs["steps"]
+            spread_pct = zs["sp"] + (zs["ep"] - zs["sp"]) * progress
+            half = zs["dim"] * spread_pct / 100 / 2
+            sx = int(zs["cx"] - half)
+            dx = 2 * zs["cx"] - sx
+            zoom_inj = self._zoom_injector if self._zoom_injector else self.injector
+            zoom_inj.zoom_tick(sx, dx, zs["cy"])
+            self._zoom_step += 1
+            if self._zoom_step > zs["steps"]:
+                zoom_inj.zoom_end()
+                self._zoom_step = 0
                 self._advance_idx()
                 self._advance_next()
             else:
@@ -481,42 +474,37 @@ class CustomMode(BaseMode):
                 self._advance_idx(step.get("then"))
                 self._advance_next()
                 return
-            shared = self.daemon._shared_uinput
-            if shared is None:
-                self._advance_idx(step.get("then"))
-                self._advance_next()
-                return
+            if not self.injector.supports_zoom:
+                if self._zoom_injector is None:
+                    print("skip zoom: not supported by current injector", file=sys.stderr)
+                    self._advance_idx(step.get("then"))
+                    self._advance_next()
+                    return
+            zoom_inj = self._zoom_injector if self._zoom_injector else self.injector
             self._then_idx = step.get("then")
             x = step.get("x", 0)
             y = step.get("y", 0)
             start_pct = max(5, min(95, step.get("start", 10)))
             end_pct = max(5, min(95, step.get("end", 90)))
             duration = step.get("duration", 200)
-            dimension = min(self.daemon.host_w, self.daemon.host_h)
+            if zoom_inj.coord_space == "host":
+                center_x, center_y = self.daemon._android_to_host(x, y)
+                dimension = min(self.daemon.host_w, self.daemon.host_h)
+            else:
+                center_x, center_y = x, y
+                dimension = min(self.daemon.android_w, self.daemon.android_h)
             steps_n = max(2, int(duration / 16))
             step_delay = max(0.001, duration / 1000.0 / steps_n)
-            center_x, center_y = self.daemon._android_to_host(x, y)
             half_start = dimension * start_pct / 100 / 2
             lx = int(center_x - half_start)
-            rx = int(center_x + half_start)
-            ui, e = shared
-            ui.write(e.EV_ABS, e.ABS_MT_SLOT, 0)
-            ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, 1)
-            ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, lx)
-            ui.write(e.EV_ABS, e.ABS_MT_POSITION_Y, center_y)
-            ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 100)
-            ui.write(e.EV_ABS, e.ABS_MT_SLOT, 1)
-            ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, 2)
-            ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, rx)
-            ui.write(e.EV_ABS, e.ABS_MT_POSITION_Y, center_y)
-            ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, 100)
-            ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
-            ui.syn()
+            rx = 2 * center_x - lx
+            zoom_inj.zoom_start(lx, rx, center_y)
+            self._zoom_step = 1
             self._zoom_state = {
-                "center_x": center_x, "center_y": center_y,
-                "dimension": dimension,
-                "start_pct": start_pct, "end_pct": end_pct,
-                "steps": steps_n, "step": 1, "step_delay": step_delay,
+                "cx": center_x, "cy": center_y,
+                "dim": dimension,
+                "sp": start_pct, "ep": end_pct,
+                "steps": steps_n, "step_delay": step_delay,
             }
             self.next_time = now + step_delay
 

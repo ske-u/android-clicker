@@ -21,6 +21,11 @@ DARK_QSS = """
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
     QWidget { background: #2a2a2a; color: #ddd; font-size: 13px; }
     QLabel { color: #bbb; font-size: 12px; }
+    QToolTip {
+        background: #181818; color: #e8e8e8;
+        border: 1px solid #444; padding: 4px 6px;
+        font-size: 13px;
+    }
     QPushButton {
         background: #333; color: #bbb; border: 1px solid #555;
         border-radius: 3px; padding: 4px 8px; font-size: 12px;
